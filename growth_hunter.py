@@ -1,7 +1,7 @@
 """
-🚀 GrowthHunter V3.1 - 10倍股猎手 (量化重构版 + 精确推送日志)
+🚀 GrowthHunter V3.2 - 10倍股猎手 (第1步进化：相对强度 RS Line + 完整基建版)
 依赖库安装: 
-pip install yfinance pandas pandas-ta requests
+pip install yfinance pandas pandas-ta requests tabulate
 """
 
 import yfinance as yf
@@ -44,7 +44,6 @@ def get_small_cap_tickers():
         except Exception:
             continue
 
-    # 逻辑修复：回退方案改为 S&P 600 小盘股，而不是 S&P 500 大盘股
     print("⚠️ Russell 2000 源失效，自动回退抓取 S&P 600 小盘股...")
     try:
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies'
@@ -58,44 +57,62 @@ def get_small_cap_tickers():
 
 def batch_technical_screen(tickers):
     """
-    第一阶段漏斗：极速批量技术面筛选 (淘汰 90% 劣质标的)
-    逻辑：超级趋势向上 + 近期出现异动爆量
+    第一阶段漏斗：极速批量技术面筛选 + RS相对强度过滤
+    加入基准 IWM (Russell 2000 ETF) 计算相对强度
     """
-    print(f"⏳ 开始第一阶段：批量下载 {len(tickers)} 只股票日线数据进行技术面扫描...")
+    print(f"⏳ 开始第一阶段：批量下载 {len(tickers)} 只股票及大盘基准(IWM)数据...")
     
-    data = yf.download(tickers, period="1y", group_by="ticker", threads=True, show_errors=False)
+    # 注入 IWM 作为大盘强弱标尺
+    download_list = tickers + ['IWM']
+    data = yf.download(download_list, period="1y", group_by="ticker", threads=True, show_errors=False)
+    
+    # 提取大盘基准收盘价
+    if 'IWM' in data.columns.levels[0]:
+        iwm_close = data['IWM']['Close']
+    else:
+        iwm_close = None
+        print("⚠️ 无法获取大盘基准数据，跳过相对强度过滤。")
+
     passed_tickers = []
     
     for sym in tickers:
         try:
-            if len(tickers) == 1:
-                df = data.copy()
-            else:
-                if sym not in data.columns.levels[0]:
-                    continue
-                df = data[sym].copy()
-                
-            df = df.dropna()
+            if sym not in data.columns.levels[0]:
+                continue
+            df = data[sym].copy()
+            df = df.dropna(subset=['Close', 'Volume'])
             if len(df) < 150: 
                 continue
-                
+            
+            # 计算超级趋势与爆量
             df.ta.supertrend(length=7, multiplier=3.0, append=True)
             vol_95th = df['Volume'].rolling(window=60).quantile(0.95)
             
-            current_close = df['Close'].iloc[-1]
+            # 【进化1：RS Line 相对强度计算】
+            rs_condition = True
+            if iwm_close is not None:
+                # 对齐日期并计算 RS 值 (个股价格 / 大盘价格)
+                aligned_iwm = iwm_close.reindex(df.index).ffill()
+                rs_line = df['Close'] / aligned_iwm
+                # 计算 RS 的 50 日均线
+                rs_sma50 = rs_line.rolling(window=50).mean()
+                # 核心逻辑：当前 RS 必须大于其 50 日均线，证明该股处于跑赢大盘的强势期
+                if not pd.isna(rs_sma50.iloc[-1]):
+                    rs_condition = rs_line.iloc[-1] > rs_sma50.iloc[-1]
+
             current_vol = df['Volume'].iloc[-1]
             last_vol_95 = vol_95th.iloc[-1]
-            
             st_dir_col = [col for col in df.columns if col.startswith('SUPERTd_')][0]
             st_dir = df[st_dir_col].iloc[-1]
             
-            if st_dir == 1 and current_vol > last_vol_95:
+            # 综合判定：上升趋势 + 爆量 + 跑赢大盘
+            if st_dir == 1 and current_vol > last_vol_95 and rs_condition:
                 passed_tickers.append(sym)
                 
         except Exception:
             continue
             
-    print(f"🎯 第一阶段完成：技术面初筛保留 {len(passed_tickers)} 只异动标的")
+    print(f"🎯 第一阶段完成：技术面与相对强度(RS)初筛保留 {len(passed_tickers)} 只硬核标的")
     return passed_tickers
 
 def analyze_fundamentals(symbol):
@@ -131,11 +148,11 @@ def analyze_fundamentals(symbol):
             return None
 
         reasons = (
-            f"市值: {market_cap/1e8:.1f}亿美元 | "
+            f"市值: {market_cap/1e8:.1f}亿 | "
             f"营收增速: {revenue_growth:.1%} | "
             f"毛利率: {gross_margin:.1%} | "
-            f"研发占比: {rd_ratio:.1%} | "
-            f"异动信号: 趋势向上且巨量突破"
+            f"研发: {rd_ratio:.1%} | "
+            f"异动信号: 趋势向上 + 爆量 + RS跑赢大盘"
         )
 
         return {
@@ -152,12 +169,12 @@ def analyze_fundamentals(symbol):
         return None
 
 def send_notifications(df):
-    """多平台推送模块 (加入精确的报错日志)"""
+    """多平台推送模块 (被误删模块已全部恢复)"""
     if df.empty:
         print("📭 今日无符合双重严苛条件的标的，不发送通知。")
         return
         
-    summary = f"🚀 AI 驱动：GrowthHunter V3.1 异动播报\n\n共捕获 {len(df)} 只高潜小盘股！\n\n"
+    summary = f"🚀 AI 驱动：GrowthHunter V3.2 异动播报\n\n共捕获 {len(df)} 只跑赢大盘的高潜股！\n\n"
     for _, row in df.head(10).iterrows():
         summary += f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
     
@@ -176,7 +193,7 @@ def send_notifications(df):
     else:
         print("⚠️ 微信(Server酱)推送跳过：未配置 SERVERCHAN_KEY")
             
-    # Telegram
+    # Telegram (已恢复)
     token = os.getenv('TELEGRAM_TOKEN')
     chat_id = os.getenv('TELEGRAM_CHAT_ID')
     if token and chat_id:
@@ -192,7 +209,7 @@ def send_notifications(df):
     else:
         print("⚠️ Telegram推送跳过：未配置 TELEGRAM_TOKEN 或 TELEGRAM_CHAT_ID")
 
-    # 飞书
+    # 飞书 (已恢复)
     feishu_webhook = os.getenv('FEISHU_WEBHOOK')
     if feishu_webhook:
         try:
@@ -211,7 +228,6 @@ def send_notifications(df):
     if dingtalk_webhook:
         try:
             res = requests.post(dingtalk_webhook, json={"msgtype": "text", "text": {"content": summary}})
-            # 钉钉正常返回是 200 且含有 errcode: 0
             if res.status_code == 200 and res.json().get('errcode') == 0:
                 print("✅ 钉钉推送已发送")
             else:
@@ -224,12 +240,11 @@ def send_notifications(df):
 def test_notifications():
     """用于独立测试推送配置是否成功"""
     print("🔧 启动推送测试模式...")
-    # 这里的文本包含了常见自定义关键词，如：测试、通知、10倍股、播报、AI
     mock_data = [{
         '股票代码': 'TEST',
         '公司名称': '配置测试专用股',
         '市值(亿美元)': 88.8,
-        '筛选理由': 'AI 测试通知：如果你能看到这条消息，说明你的配置正确！(模拟播报 10倍股)'
+        '筛选理由': 'AI 测试通知：相对强度(RS)引擎已挂载！如果你能看到这条消息，说明你的配置正确。'
     }]
     df = pd.DataFrame(mock_data)
     send_notifications(df)
@@ -237,7 +252,7 @@ def test_notifications():
 
 def main():
     print("="*40)
-    print(" 🚀 启动 GrowthHunter 量化重构版")
+    print(" 🚀 启动 GrowthHunter V3.2 (RS增强完整版)")
     print("="*40)
     
     tickers = get_small_cap_tickers()
@@ -265,15 +280,16 @@ def main():
         df = df.sort_values(by='市值(亿美元)') 
         df.to_csv('growth_hunter_results.csv', index=False, encoding='utf-8')
         
+        # Markdown 生成模块 (已恢复)
         with open('growth_hunter_results.md', 'w', encoding='utf-8') as f:
             f.write("# 🚀 GrowthHunter 严选报告\n\n")
             f.write(f"**生成时间**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("**量化策略**：SuperTrend右侧 + 95分位爆量突破 + >20%营收增长 + 高研发驱动\n\n")
+            f.write("**量化策略**：SuperTrend右侧 + 95分位爆量突破 + RS跑赢大盘 + >20%营收增长 + 高研发驱动\n\n")
             f.write(df.to_markdown(index=False))
             
         print(f"\n🎉 筛选大功告成！最终捕获 {len(results)} 只硬核标的。")
     else:
-        print("\n📉 遗憾：财务数据(增速/毛利)未达标，今日空仓。")
+        print("\n📉 遗憾：财务数据未达标或大盘太弱，今日空仓。")
 
     send_notifications(df)
 
