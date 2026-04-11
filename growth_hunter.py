@@ -1,6 +1,6 @@
 """
-🚀 GrowthHunter V4.0 - 10倍股猎手 (第4步：PEAD跳空漂移 + 终极工程优化版)
-策略进化：加入向上跳空缺口(Gap Up)识别，锁定机构事件驱动标的
+🚀 GrowthHunter V5.0 - 10倍股猎手 (最终旗舰版：Piotroski F-Score 财务体检)
+策略进化：加入 F-Score 9分制财务健康评分，确保异动标的底盘扎实。
 """
 
 import yfinance as yf
@@ -13,6 +13,7 @@ import requests
 import time
 import random
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
@@ -26,7 +27,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
 ]
 
-# 【优化9】：配置线程本地存储 (Thread Local)，为每个线程分配独享的 Session
+# 配置线程本地存储 (Thread Local)，为每个线程分配独享的 Session
 thread_local = threading.local()
 
 def get_session():
@@ -88,15 +89,10 @@ def get_small_cap_tickers():
 def check_unfilled_gap(df, lookback=10):
     """
     PEAD 严格跳空缺口校验：不仅要跳空，还要后续从未回补。
-    ⚠️ 核心假设说明 (防盘中误判)：
-    若策略在盘中运行，当日的跳空(即 len(post_gap_lows) == 0)暂视为未回补。
-    因 df['Low'] 会随盘中价格实时更新，若盘中回补缺口，gap_up 将在底层变为 False。
-    为确保数据绝对沉淀，本策略最佳运行时间为【每日收盘后】。
     """
     if len(df) < lookback + 2: 
         return False
         
-    # 1. 识别跳空日：当日最低价 > 前日最高价，且开盘跳空幅度 > 2%
     gap_up = (df['Low'] > df['High'].shift(1)) & (df['Open'] > df['Close'].shift(1) * 1.02)
     recent_gaps = gap_up.iloc[-lookback:]
     gap_indices = recent_gaps[recent_gaps].index
@@ -109,11 +105,12 @@ def check_unfilled_gap(df, lookback=10):
         pre_gap_high = df['High'].iloc[gap_idx - 1]
         post_gap_lows = df['Low'].iloc[gap_idx + 1:]
         
-        # 2. 若跳空发生在最后一条 K 线 (今日)，且 gap_up 依然成立，视为尚未回补
         if len(post_gap_lows) == 0:
-            return True
+            # 盘中实时防护：即使没有后续天数，也需再次确认最新 Low 未在日内跌破前高
+            if df['Low'].iloc[-1] > pre_gap_high:
+                return True
+            continue
             
-        # 3. 检查跳空日之后的所有最低价，是否从未跌破跳空前一日的最高价
         if (post_gap_lows > pre_gap_high).all():
             return True
             
@@ -127,7 +124,6 @@ def batch_technical_screen(tickers):
     
     download_list = tickers + ['IWM']
     
-    # 【优化10】：增加 yfinance 网络波动重试机制 (最多 3 次)
     data = None
     for attempt in range(3):
         data = yf.download(download_list, period="1y", group_by="ticker", threads=True, show_errors=False)
@@ -140,7 +136,6 @@ def batch_technical_screen(tickers):
         print("❌ Yahoo Finance 接口请求失败或重试耗尽，本次筛选终止。")
         return []
     
-    # 提取 IWM 基准并处理时区
     iwm_close = None
     if isinstance(data.columns, pd.MultiIndex) and 'IWM' in data.columns.get_level_values(0):
         iwm_close = data['IWM']['Close']
@@ -151,7 +146,6 @@ def batch_technical_screen(tickers):
         if getattr(iwm_close.index, 'tz', None) is not None:
             iwm_close.index = iwm_close.index.tz_localize(None)
     else:
-        # 【终极优化6】：IWM 缺失则快速失败
         print("❌ 核心基准(IWM)获取失败，无法计算相对强度，终止流程。")
         return []
 
@@ -171,11 +165,8 @@ def batch_technical_screen(tickers):
             if getattr(df.index, 'tz', None) is not None:
                 df.index = df.index.tz_localize(None)
             
-            # 1. 指标计算
             df.ta.supertrend(length=7, multiplier=3.0, append=True)
             df.ta.atr(length=20, append=True) 
-            
-            # 【撤销错误补丁】：完全移除直接修改原始 High 价格的逻辑，信任 pandas_ta 内部安全的防除零机制
             df.ta.cmf(length=20, append=True)
             
             vol_95th = df['Volume'].rolling(window=60).quantile(0.95)
@@ -187,35 +178,29 @@ def batch_technical_screen(tickers):
             
             atr_col, cmf_col = atr_cols[0], cmf_cols[0]
             
-            # 【优化8】：提前提取[-1]最后一行索引值，减少重复底层 iloc 开销
             idx = -1
             current_close = df['Close'].iloc[idx]
             current_vol = df['Volume'].iloc[idx]
             
-            # 2. Squeeze 挤压突破 (昨日仍挤压，今日突破)
             sma20 = df['Close'].rolling(window=20).mean()
             std20 = df['Close'].rolling(window=20).std()
             bb_upper, bb_lower = sma20 + 2 * std20, sma20 - 2 * std20
             kc_upper, kc_lower = sma20 + 1.5 * df[atr_col], sma20 - 1.5 * df[atr_col]
             squeeze_on = (bb_upper < kc_upper) & (bb_lower > kc_lower)
             
-            # 【逻辑修正2】：防 NaN 与索引越界，安全获取昨日挤压状态
             yesterday_squeeze = squeeze_on.iloc[-2] if len(squeeze_on) >= 2 else False
             is_squeeze_break = (current_close > kc_upper.iloc[idx]) and (yesterday_squeeze == True)
 
-            # 3. RS 相对强度 (跑赢大盘)
-            rs_condition = True
-            # 【逻辑修正3】：使用线性插值并辅以 bfill() 和 ffill()，彻底抹平两端任何可能的前导或滞后 NaN
-            aligned_iwm = iwm_close.reindex(df.index).interpolate(method='linear').ffill().bfill()
+            # 默认 RS 不合格，严防缺数据导致的放行
+            rs_condition = False
+            aligned_iwm = iwm_close.reindex(df.index).interpolate(method='linear').ffill()
             rs_line = df['Close'] / aligned_iwm
             rs_sma50 = rs_line.rolling(window=50).mean()
-            if not pd.isna(rs_sma50.iloc[idx]):
+            if not pd.isna(rs_sma50.iloc[idx]) and not pd.isna(rs_line.iloc[idx]):
                 rs_condition = rs_line.iloc[idx] > rs_sma50.iloc[idx]
 
-            # 4. 【逻辑修正1】：PEAD 严格跳空缺口识别 (调用刚刚补回来的辅助函数)
             has_unfilled_gap = check_unfilled_gap(df, lookback=10)
 
-            # 提取关键值
             last_vol_95, last_vol_ma20 = vol_95th.iloc[idx], vol_ma20.iloc[idx]
             current_cmf = df[cmf_col].iloc[idx]
             
@@ -227,11 +212,10 @@ def batch_technical_screen(tickers):
             
             vol_threshold = max(last_vol_ma20 * 1.5, last_vol_95 * 0.8)
             
-            # 综合漏斗判定
             if (st_dir == 1 and 
                 current_vol > vol_threshold and 
                 rs_condition and 
-                (is_squeeze_break or has_unfilled_gap) and # Squeeze 突破或近期有强力跳空
+                (is_squeeze_break or has_unfilled_gap) and 
                 current_cmf > 0):
                 
                 passed_tickers.append(sym)
@@ -242,101 +226,207 @@ def batch_technical_screen(tickers):
     print(f"🎯 第一阶段完成：PEAD + 资金追踪漏斗保留 {len(passed_tickers)} 只标的")
     return passed_tickers
 
+def calculate_piotroski_f_score(bs, cf, inc):
+    """
+    【进化5】：Piotroski F-Score 复合财务健康评分 (0-9分)
+    参数已修改为直接传入财务表 DataFrame，避免重复请求
+    """
+    f_score = 0
+    try:
+        if bs is None or cf is None or inc is None:
+            return "N/A"
+        if bs.empty or cf.empty or inc.empty or len(bs.columns) < 2 or len(inc.columns) < 2:
+            return "N/A"
+            
+        def get_val(df, keys, idx=0):
+            if df.empty or len(df.columns) <= idx:
+                return 0
+            try:
+                sorted_cols = sorted(df.columns, reverse=True)
+                df = df[sorted_cols]
+            except Exception:
+                pass
+            df_idx_lower = {str(k).lower().strip(): k for k in df.index}
+            for key in keys:
+                key_lower = key.lower().strip()
+                # 仅保留严格的脱敏匹配，杜绝意外包含导致的错误挂载
+                if key_lower in df_idx_lower:
+                    val = df.loc[df_idx_lower[key_lower]].iloc[idx]
+                    if not pd.isna(val): return val
+            return 0
+
+        # 当前期 (全面扩充常见字段别名以防漏判)
+        ni = get_val(inc, ['Net Income Common Stockholders', 'Net Income', 'Net Income From Continuing And Discontinued Operation', 'Net Income Including Noncontrolling Interests'])
+        ta_cur = get_val(bs, ['Total Assets'])
+        cfo = get_val(cf, ['Operating Cash Flow', 'Cash Flow From Operating Activities', 'Total Cash From Operating Activities', 'Net Cash Provided By Operating Activities'])
+        lt_debt = get_val(bs, ['Long Term Debt', 'Total Long Term Debt', 'Long Term Debt And Capital Lease Obligation', 'Long Term Debt Noncurrent'])
+        cur_assets = get_val(bs, ['Current Assets', 'Total Current Assets'])
+        cur_liab = get_val(bs, ['Current Liabilities', 'Total Current Liabilities'])
+        shares = get_val(bs, ['Ordinary Shares Number', 'Share Issued', 'Basic Average Shares', 'Diluted Average Shares'])
+        gp = get_val(inc, ['Gross Profit', 'Total Gross Profit'])
+        rev = get_val(inc, ['Total Revenue', 'Operating Revenue', 'Revenue'])
+        
+        # 上一期
+        ni_prev = get_val(inc, ['Net Income Common Stockholders', 'Net Income', 'Net Income From Continuing And Discontinued Operation', 'Net Income Including Noncontrolling Interests'], 1)
+        ta_prev = get_val(bs, ['Total Assets'], 1)
+        lt_debt_prev = get_val(bs, ['Long Term Debt', 'Total Long Term Debt', 'Long Term Debt And Capital Lease Obligation', 'Long Term Debt Noncurrent'], 1)
+        cur_assets_prev = get_val(bs, ['Current Assets', 'Total Current Assets'], 1)
+        cur_liab_prev = get_val(bs, ['Current Liabilities', 'Total Current Liabilities'], 1)
+        shares_prev = get_val(bs, ['Ordinary Shares Number', 'Share Issued', 'Basic Average Shares', 'Diluted Average Shares'], 1)
+        gp_prev = get_val(inc, ['Gross Profit', 'Total Gross Profit'], 1)
+        rev_prev = get_val(inc, ['Total Revenue', 'Operating Revenue', 'Revenue'], 1)
+
+        # 盈利能力
+        roa = ni / ta_cur if ta_cur else 0
+        roa_prev = ni_prev / ta_prev if ta_prev else 0
+        if roa > 0: f_score += 1                     # 1. ROA 为正
+        if cfo > 0: f_score += 1                     # 2. CFO 为正
+        if roa > roa_prev: f_score += 1              # 3. ROA 增长
+        if cfo > ni: f_score += 1                    # 4. 盈余质量 (CFO > NI)
+
+        # 杠杆、流动性与资金来源
+        lev = lt_debt / ta_cur if ta_cur else 0
+        lev_prev = lt_debt_prev / ta_prev if ta_prev else 0
+        if lev < lev_prev: f_score += 1              # 5. 长期债务杠杆降低
+        
+        cr = cur_assets / cur_liab if cur_liab else 0
+        cr_prev = cur_assets_prev / cur_liab_prev if cur_liab_prev else 0
+        if cr > cr_prev: f_score += 1                # 6. 流动比率改善
+        
+        if shares > 0 and shares_prev > 0 and shares <= shares_prev: f_score += 1 # 7. 未增发新股
+
+        # 运营效率
+        gm = gp / rev if rev else 0
+        gm_prev = gp_prev / rev_prev if rev_prev else 0
+        if gm > gm_prev: f_score += 1                # 8. 毛利率提升
+        
+        ato = rev / ta_cur if ta_cur else 0
+        ato_prev = rev_prev / ta_prev if ta_prev else 0
+        if ato > ato_prev: f_score += 1              # 9. 资产周转率提升
+
+        return f_score
+    except Exception:
+        return "N/A"
+
 def analyze_fundamentals(symbol):
     """
-    第二阶段漏斗：精准财务基本面过滤 (线程安全 TLS 链接池 + 回退计算)
+    第二阶段漏斗：精准财务基本面过滤 (增加 F-Score 体检)
     """
     time.sleep(random.uniform(0.2, 1.0))
     
-    try:
-        # 【优化9】：利用 Thread Local 安全获取线程独占的 Session
-        local_session = get_session()
-        ticker = yf.Ticker(symbol, session=local_session)
-        
-        info = ticker.info
-        if not info or 'longName' not in info: return None
+    for attempt in range(2):
+        try:
+            local_session = get_session()
+            ticker = yf.Ticker(symbol, session=local_session)
+            
+            info = ticker.info
+            if not info or 'longName' not in info: return None
 
-        # 市值严控 20 亿以内
-        market_cap = info.get('marketCap', 0)
-        if not (5e7 < market_cap < 2e9): return None
+            market_cap = info.get('marketCap', 0)
+            if not (5e7 < market_cap < 2e9): return None
 
-        # 营收增速回退计算 (YoY)
-        revenue_growth = info.get('revenueGrowth')
-        if revenue_growth is None:
-            try:
-                income_stmt = ticker.income_stmt
-                if not income_stmt.empty and 'Total Revenue' in income_stmt.index:
-                    revs = income_stmt.loc['Total Revenue'].dropna()
-                    if len(revs) >= 2 and revs.iloc[1] > 0:
-                        revenue_growth = (revs.iloc[0] - revs.iloc[1]) / revs.iloc[1]
-            except Exception: pass
-                
-        if revenue_growth is None or revenue_growth < 0.20: return None
+            # 统一提前提取财务报表，大幅减少重复的 HTTP 请求
+            inc = ticker.income_stmt
+            bs = ticker.balance_sheet
+            cf = ticker.cashflow
 
-        # 毛利率回退计算 (Gross Margin)
-        # 【终极优化5】：毛利率缺失回退计算
-        gross_margin = info.get('grossMargins')
-        if gross_margin is None:
-            try:
-                income_stmt = ticker.income_stmt
-                if not income_stmt.empty and 'Gross Profit' in income_stmt.index and 'Total Revenue' in income_stmt.index:
-                    gp = income_stmt.loc['Gross Profit'].dropna()
-                    revs_gm = income_stmt.loc['Total Revenue'].dropna()
-                    if len(gp) > 0 and len(revs_gm) > 0 and revs_gm.iloc[0] > 0:
-                        gross_margin = gp.iloc[0] / revs_gm.iloc[0]
-            except Exception: pass
+            revenue_growth = info.get('revenueGrowth')
+            
+            # 抽取营收数据，加入常见别名防漏判
+            rev_row = None
+            if not inc.empty:
+                for k in ['Total Revenue', 'Operating Revenue', 'Revenue']:
+                    if k in inc.index:
+                        rev_row = inc.loc[k].dropna()
+                        break
 
-        if gross_margin is None or gross_margin < 0.20: return None
+            if revenue_growth is None and rev_row is not None:
+                try:
+                    if len(rev_row) >= 2 and rev_row.iloc[1] > 0:
+                        revenue_growth = (rev_row.iloc[0] - rev_row.iloc[1]) / rev_row.iloc[1]
+                except Exception: pass
+                    
+            if revenue_growth is None or revenue_growth < 0.20: return None
 
-        total_revenue = info.get('totalRevenue', 0)
-        rd_expense = info.get('researchAndDevelopment')
-        rd_ratio = (rd_expense / total_revenue) if (rd_expense and total_revenue > 0) else 0
-        
-        sector = info.get('sector', '')
-        if sector in {'Healthcare', 'Technology'} and rd_ratio < 0.08: return None
+            gross_margin = info.get('grossMargins')
+            if gross_margin is None:
+                try:
+                    gp_row = None
+                    if not inc.empty:
+                        for k in ['Gross Profit', 'Total Gross Profit']:
+                            if k in inc.index:
+                                gp_row = inc.loc[k].dropna()
+                                break
+                    if gp_row is not None and rev_row is not None and len(gp_row) > 0 and len(rev_row) > 0 and rev_row.iloc[0] > 0:
+                        gross_margin = gp_row.iloc[0] / rev_row.iloc[0]
+                except Exception: pass
 
-        rg_str = f"{revenue_growth:.1%}" if revenue_growth is not None else "N/A"
-        gm_str = f"{gross_margin:.1%}" if gross_margin is not None else "N/A"
-        rd_str = f"{rd_ratio:.1%}" if rd_ratio > 0 else "N/A"
+            if gross_margin is None or gross_margin < 0.20: return None
+            
+            # 传入已获取的报表参数，防止 F-Score 内部重复发起请求
+            f_score = calculate_piotroski_f_score(bs, cf, inc)
+            
+            # 剔除 F-Score 低于 5 分的财务弱势股，以及数据严重缺失(N/A)无法完成体检的标的
+            if not isinstance(f_score, int) or f_score < 5:
+                return None
 
-        reasons = (
-            f"市值: {market_cap/1e8:.1f}亿 | "
-            f"增速: {rg_str} | "
-            f"毛利: {gm_str} | "
-            f"研发: {rd_str} | "
-            f"信号: 资金流入 + PEAD跳空/挤压起爆"
-        )
+            total_revenue = info.get('totalRevenue', 0)
+            rd_expense = info.get('researchAndDevelopment')
+            rd_ratio = (rd_expense / total_revenue) if (rd_expense and total_revenue > 0) else 0
+            
+            sector = info.get('sector', '')
+            if sector in {'Healthcare', 'Technology'} and rd_ratio < 0.08: return None
 
-        return {
-            '股票代码': symbol,
-            '公司名称': info.get('longName', symbol),
-            '所属行业': sector,
-            '市值(亿美元)': round(market_cap / 1e8, 2),
-            '营收增速': rg_str,
-            '筛选理由': reasons,
-            '链接': f"https://finance.yahoo.com/quote/{symbol}"
-        }
+            rg_str = f"{revenue_growth:.1%}" if revenue_growth is not None else "N/A"
+            gm_str = f"{gross_margin:.1%}" if gross_margin is not None else "N/A"
+            rd_str = f"{rd_ratio:.1%}" if rd_ratio > 0 else "N/A"
+            f_score_str = f"{f_score}/9" if isinstance(f_score, int) else "N/A"
 
-    except Exception:
-        return None
+            reasons = (
+                f"市值: {market_cap/1e8:.1f}亿 | "
+                f"增速: {rg_str} | "
+                f"毛利: {gm_str} | "
+                f"F-Score: {f_score_str} | "
+                f"信号: 资金流入 + PEAD跳空/挤压起爆"
+            )
+
+            return {
+                '股票代码': symbol,
+                '公司名称': info.get('longName', symbol),
+                '所属行业': sector,
+                '市值(亿美元)': round(market_cap / 1e8, 2),
+                '营收增速': rg_str,
+                'F-Score': f_score_str,
+                '筛选理由': reasons,
+                '链接': f"https://finance.yahoo.com/quote/{symbol}"
+            }
+
+        except Exception:
+            if hasattr(thread_local, "session"):
+                try:
+                    thread_local.session.close()
+                except Exception:
+                    pass
+                del thread_local.session
+            if attempt == 1: 
+                return None
 
 def send_notifications(df):
-    """多平台推送模块 (安全截断)"""
+    """多平台推送模块"""
     if df.empty:
         print("📭 今日无符合双重严苛条件的标的。")
         return
         
-    summary = f"🚀 AI 驱动：GrowthHunter V4.0 异动播报\n\n捕获 {len(df)} 只底池起爆/跳空高潜股！\n\n"
+    summary = f"🚀 AI 驱动：GrowthHunter V5.0 异动播报\n\n捕获 {len(df)} 只财务满级的高潜起爆股！\n\n"
     max_len = 3500
     for _, row in df.head(10).iterrows():
-        item_text = f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
+        item_text = f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿) 🌟 F-Score: {row.get('F-Score', 'N/A')}\n  └ {row['筛选理由']}\n\n"
         if len(summary) + len(item_text) > max_len:
             summary += "...（内容过长已自动截断）"
             break
         summary += item_text
         
     status_report = []
-    # 推送逻辑 (恢复 Telegram 并优化报错详情)
     platforms = [
         ('微信', 'SERVERCHAN_KEY'), 
         ('飞书', 'FEISHU_WEBHOOK'), 
@@ -351,15 +441,15 @@ def send_notifications(df):
             continue
         try:
             if platform == '微信':
-                res = requests.get(f"https://sctapi.ftqq.com/{val}.send", params={"title": "🚀 PEAD跳空起爆预警", "desp": summary})
+                res = requests.get(f"https://sctapi.ftqq.com/{val}.send", params={"title": "🚀 F-Score及格起爆预警", "desp": summary})
             elif platform == 'Telegram':
                 chat_id = os.getenv('TELEGRAM_CHAT_ID')
                 if not chat_id:
                     status_report.append(f"⚪ Telegram: 未配置 CHAT_ID")
                     continue
-                # 【优化12】：转义 Telegram Markdown 特殊字符（如下划线、星号），防止解析崩溃
-                tg_summary = summary.replace('_', '\\_').replace('*', '\\*')
-                res = requests.post(f"https://api.telegram.org/bot{val}/sendMessage", json={"chat_id": chat_id, "text": tg_summary, "parse_mode": "Markdown"})
+                # 升级为 MarkdownV2 并使用正则全量转义特殊字符，杜绝解析崩溃
+                tg_summary = re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', summary)
+                res = requests.post(f"https://api.telegram.org/bot{val}/sendMessage", json={"chat_id": chat_id, "text": tg_summary, "parse_mode": "MarkdownV2"})
             else:
                 payload = {"msg_type": "text", "content": {"text": summary}} if platform == '飞书' else {"msgtype": "text", "text": {"content": summary}}
                 res = requests.post(val, json=payload)
@@ -377,11 +467,11 @@ def send_notifications(df):
 
 def test_notifications():
     print("🔧 启动推送测试模式...")
-    mock_data = [{'股票代码': 'TEST', '公司名称': '配置测试股', '市值(亿美元)': 8.8, '筛选理由': 'PEAD & Squeeze 引擎双重就绪！'}]
+    mock_data = [{'股票代码': 'TEST', '公司名称': '配置测试股', '市值(亿美元)': 8.8, 'F-Score': '9/9', '筛选理由': 'F-Score 财务体检系统全线就绪！'}]
     send_notifications(pd.DataFrame(mock_data))
 
 def main():
-    print("="*40 + "\n 🚀 GrowthHunter V4.0 (PEAD进化版)\n" + "="*40)
+    print("="*40 + "\n 🚀 GrowthHunter V5.0 (旗舰大结局版)\n" + "="*40)
     tickers = get_small_cap_tickers()
     if not tickers: return
 
@@ -389,9 +479,8 @@ def main():
     if not passed_tech_tickers: return
 
     results = []
-    print(f"⏳ 第二阶段：深挖 {len(passed_tech_tickers)} 只股票财务数据...")
+    print(f"⏳ 第二阶段：深挖 {len(passed_tech_tickers)} 只股票财务与 F-Score 体检...")
     with ThreadPoolExecutor(max_workers=4) as executor:
-        # 移除了原有的 session 参数传递，直接调用
         futures = {executor.submit(analyze_fundamentals, sym): sym for sym in passed_tech_tickers}
         for f in as_completed(futures):
             res = f.result()
