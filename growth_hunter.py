@@ -173,6 +173,8 @@ def send_notifications(df):
                 print(f"❌ 微信推送返回异常: {res.text}")
         except Exception as e:
             print(f"❌ 微信请求失败: {e}")
+    else:
+        print("⚠️ 微信(Server酱)推送跳过：未配置 SERVERCHAN_KEY")
             
     # Telegram
     token = os.getenv('TELEGRAM_TOKEN')
@@ -187,6 +189,8 @@ def send_notifications(df):
                 print(f"❌ Telegram推送异常: {res.text}")
         except Exception as e:
             print(f"❌ Telegram请求失败: {e}")
+    else:
+        print("⚠️ Telegram推送跳过：未配置 TELEGRAM_TOKEN 或 TELEGRAM_CHAT_ID")
 
     # 飞书
     feishu_webhook = os.getenv('FEISHU_WEBHOOK')
@@ -199,6 +203,8 @@ def send_notifications(df):
                 print(f"❌ 飞书推送异常: {res.text}")
         except Exception as e:
             print(f"❌ 飞书请求失败: {e}")
+    else:
+        print("⚠️ 飞书推送跳过：未配置 FEISHU_WEBHOOK")
 
     # 钉钉
     dingtalk_webhook = os.getenv('DINGTALK_WEBHOOK')
@@ -212,6 +218,8 @@ def send_notifications(df):
                 print(f"❌ 钉钉拒绝推送 (请检查机器人安全关键词设置): {res.text}")
         except Exception as e:
             print(f"❌ 钉钉请求报错: {e}")
+    else:
+        print("⚠️ 钉钉推送跳过：未配置 DINGTALK_WEBHOOK (系统未检测到该环境变量)")
 
 def test_notifications():
     """用于独立测试推送配置是否成功"""
@@ -225,7 +233,7 @@ def test_notifications():
     }]
     df = pd.DataFrame(mock_data)
     send_notifications(df)
-    print("✅ 测试推送指令发送完毕，请查看上方是否有 ❌ 报错。")
+    print("✅ 测试推送指令发送完毕，请查看上方是否有 ❌ 报错或 ⚠️ 警告。")
 
 def main():
     print("="*40)
