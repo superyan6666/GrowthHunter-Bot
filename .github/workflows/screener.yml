@@ -2,8 +2,8 @@ name: GrowthHunter Bot v2.1 - 10倍股猎手
 
 on:
   schedule:
-    - cron: '0 8 * * 1,3,5'   # 周一、三、五 UTC 8:00（北京时间 16:00）
-  workflow_dispatch:
+    - cron: '0 8 * * 1,3,5'   # 周一、三、五 北京时间 16:00 自动运行
+  workflow_dispatch:          # 允许手动触发
 
 jobs:
   run:
@@ -36,6 +36,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "没有新变化"
           else
-            git commit -m "🤖 v2.1 每日更新：$(date +'%Y-%m-%d') 筛选结果 + 推送"
+            git commit -m "🤖 v2.1 更新：$(date +'%Y-%m-%d') 筛选结果 + 推送"
             git push
           fi
