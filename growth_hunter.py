@@ -9,6 +9,7 @@ import pandas as pd
 import pandas_ta as ta
 from datetime import datetime
 import os
+import sys
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
@@ -167,7 +168,7 @@ def analyze_fundamentals(symbol):
         return None
 
 def send_notifications(df):
-    """多平台推送模块 (保留了原有的优质框架)"""
+    """多平台推送模块 (支持微信、Telegram、飞书、钉钉)"""
     if df.empty:
         print("📭 今日无符合双重严苛条件的标的，不发送通知。")
         return
@@ -176,15 +177,57 @@ def send_notifications(df):
     for _, row in df.head(10).iterrows():
         summary += f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
     
-    # 仅展示 ServerChan 微信推送示例，其他平台逻辑与原代码一致
+    # 微信 (Server酱)
     serverchan_key = os.getenv('SERVERCHAN_KEY')
     if serverchan_key:
         try:
             requests.get(f"https://sctapi.ftqq.com/{serverchan_key}.send",
                          params={"title": f"🚀 发现 {len(df)} 只异动 10 倍候选股", "desp": summary})
-            print("✅ 微信推送已发送")
+            print("✅ 微信(Server酱)推送已发送")
         except:
             pass
+            
+    # Telegram
+    token = os.getenv('TELEGRAM_TOKEN')
+    chat_id = os.getenv('TELEGRAM_CHAT_ID')
+    if token and chat_id:
+        try:
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat_id, "text": summary, "parse_mode": "Markdown"})
+            print("✅ Telegram推送已发送")
+        except:
+            pass
+
+    # 飞书
+    feishu_webhook = os.getenv('FEISHU_WEBHOOK')
+    if feishu_webhook:
+        try:
+            requests.post(feishu_webhook, json={"msg_type": "text", "content": {"text": summary}})
+            print("✅ 飞书推送已发送")
+        except:
+            pass
+
+    # 钉钉
+    dingtalk_webhook = os.getenv('DINGTALK_WEBHOOK')
+    if dingtalk_webhook:
+        try:
+            requests.post(dingtalk_webhook, json={"msgtype": "text", "text": {"content": summary}})
+            print("✅ 钉钉推送已发送")
+        except:
+            pass
+
+def test_notifications():
+    """用于独立测试推送配置是否成功"""
+    print("🔧 启动推送测试模式...")
+    mock_data = [{
+        '股票代码': 'TEST',
+        '公司名称': '配置测试专用股',
+        '市值(亿美元)': 88.8,
+        '筛选理由': '这是一条测试消息。如果你能看到这条消息，说明你的密钥和 Webhook 配置完全正确！🎉'
+    }]
+    df = pd.DataFrame(mock_data)
+    send_notifications(df)
+    print("✅ 测试推送指令已发出，请检查你的接收软件。")
 
 def main():
     print("="*40)
@@ -238,4 +281,7 @@ def main():
     send_notifications(df)
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == '--test':
+        test_notifications()
+    else:
+        main()
