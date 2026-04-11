@@ -1,4 +1,6 @@
-pandas
 yfinance
+pandas
+pandas_ta
 requests
 lxml
+html5lib
