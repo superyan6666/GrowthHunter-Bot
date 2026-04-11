@@ -157,7 +157,7 @@ def send_notifications(df):
         print("📭 今日无符合双重严苛条件的标的，不发送通知。")
         return
         
-    summary = f"🚀 AI 驱动：GrowthHunter V3.1 异动播报\n\n共捕获 {len(df)} 只高潜小盘股！\n\n"
+    summary = f"🚀 GrowthHunter V3.1 异动播报\n\n共捕获 {len(df)} 只高潜小盘股！\n\n"
     for _, row in df.head(10).iterrows():
         summary += f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
     
@@ -166,7 +166,7 @@ def send_notifications(df):
     if serverchan_key:
         try:
             res = requests.get(f"https://sctapi.ftqq.com/{serverchan_key}.send",
-                         params={"title": f"🚀 AI 发现 {len(df)} 只异动 10 倍候选股", "desp": summary})
+                         params={"title": f"🚀 发现 {len(df)} 只异动 10 倍候选股", "desp": summary})
             if res.status_code == 200:
                 print("✅ 微信(Server酱)推送已发送")
             else:
@@ -216,12 +216,12 @@ def send_notifications(df):
 def test_notifications():
     """用于独立测试推送配置是否成功"""
     print("🔧 启动推送测试模式...")
-    # 这里的文本包含了常见自定义关键词，如：测试、通知、10倍股、播报、AI
+    # 这里的文本包含了常见自定义关键词，如：测试、通知、10倍股、播报
     mock_data = [{
         '股票代码': 'TEST',
         '公司名称': '配置测试专用股',
         '市值(亿美元)': 88.8,
-        '筛选理由': 'AI 测试通知：如果你能看到这条消息，说明你的配置正确！(模拟播报 10倍股)'
+        '筛选理由': '测试通知：如果你能看到这条消息，说明你的配置正确！(模拟播报 10倍股)'
     }]
     df = pd.DataFrame(mock_data)
     send_notifications(df)
