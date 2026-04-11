@@ -2,10 +2,14 @@ name: 🚀 每日运行 GrowthHunter
 
 on:
   schedule:
-    # 太平洋时间 (PT) 每天下午 1:30 运行 (美东时间下午 4:30，即美股刚收盘后)
-    # 注意：cron 使用的是 UTC 时间。UTC 20:30 约等于夏令时 PT 13:30 / ET 16:30
     - cron: '30 20 * * 1-5' # 周一到周五运行
-  workflow_dispatch: # 允许手动点击按钮运行
+  workflow_dispatch: # 允许手动运行
+    inputs:
+      test_mode:
+        description: '🧪 仅测试推送配置 (不拉取股票数据)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-bot:
@@ -27,10 +31,17 @@ jobs:
 
     - name: 运行量化程序
       env:
-        # 在 GitHub 仓库的 Settings -> Secrets and variables -> Actions 中配置以下机密
+        # 将你在 GitHub Settings 中配置的 Secrets 映射到环境变量
         SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
-        # 如果需要其他推送平台，也可以在这里加
-        # TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        # TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
       run: |
-        python growth_hunter.py
+        if [ "${{ inputs.test_mode }}" == "true" ]; then
+          echo "检测到测试模式，执行推送测试..."
+          python growth_hunter.py --test
+        else
+          echo "执行全量股票筛选..."
+          python growth_hunter.py
+        fi
