@@ -1,7 +1,7 @@
 """
-🚀 GrowthHunter V3.0 - 10倍股猎手 (量化重构版)
+🚀 GrowthHunter V3.1 - 10倍股猎手 (量化重构版 + 精确推送日志)
 依赖库安装: 
-pip install yfinance pandas pandas_ta requests
+pip install yfinance pandas pandas-ta requests
 """
 
 import yfinance as yf
@@ -63,14 +63,11 @@ def batch_technical_screen(tickers):
     """
     print(f"⏳ 开始第一阶段：批量下载 {len(tickers)} 只股票日线数据进行技术面扫描...")
     
-    # 批量下载，按 ticker 分组。为防止内存爆炸或请求失败，其实可以分块下载，这里直接全量
     data = yf.download(tickers, period="1y", group_by="ticker", threads=True, show_errors=False)
-    
     passed_tickers = []
     
     for sym in tickers:
         try:
-            # 处理单只或多只股票下载时的数据结构差异
             if len(tickers) == 1:
                 df = data.copy()
             else:
@@ -79,25 +76,19 @@ def batch_technical_screen(tickers):
                 df = data[sym].copy()
                 
             df = df.dropna()
-            if len(df) < 150:  # 上市时间不足的次新股暂不考虑
+            if len(df) < 150: 
                 continue
                 
-            # 计算量化指标
-            # 1. Supertrend (参数: 7周期, 3倍ATR)
             df.ta.supertrend(length=7, multiplier=3.0, append=True)
-            # 2. 60日成交量的 95% 分位数 (识别异动爆量)
             vol_95th = df['Volume'].rolling(window=60).quantile(0.95)
             
-            # 获取最新一日数据
             current_close = df['Close'].iloc[-1]
             current_vol = df['Volume'].iloc[-1]
             last_vol_95 = vol_95th.iloc[-1]
             
-            # 动态获取超级趋势方向列名 (通常是 SUPERTd_7_3.0, 1代表多头, -1代表空头)
             st_dir_col = [col for col in df.columns if col.startswith('SUPERTd_')][0]
             st_dir = df[st_dir_col].iloc[-1]
             
-            # 核心过滤逻辑：处于上升趋势 且 出现放量突破
             if st_dir == 1 and current_vol > last_vol_95:
                 passed_tickers.append(sym)
                 
@@ -110,7 +101,6 @@ def batch_technical_screen(tickers):
 def analyze_fundamentals(symbol):
     """
     第二阶段漏斗：精准财务基本面过滤 (只对初筛通过的股票执行)
-    逻辑：小市值 + 高增长 + 高研发
     """
     try:
         ticker = yf.Ticker(symbol)
@@ -118,7 +108,6 @@ def analyze_fundamentals(symbol):
         if not info or 'longName' not in info:
             return None
 
-        # 1. 市值严格限制在 5000万 ~ 50亿美元（真正的 10 倍摇篮）
         market_cap = info.get('marketCap', 0)
         if not (5e7 < market_cap < 5e9): 
             return None
@@ -126,17 +115,14 @@ def analyze_fundamentals(symbol):
         name = info.get('longName', symbol)
         sector = info.get('sector', '')
 
-        # 2. 营收增速 > 20%
         revenue_growth = info.get('revenueGrowth')
         if revenue_growth is None or revenue_growth < 0.20:
             return None
 
-        # 3. 基础毛利要求 (避免赔本赚吆喝)
         gross_margin = info.get('grossMargins')
         if gross_margin is None or gross_margin < 0.20:
             return None
 
-        # 4. 研发费用率驱动 (科技/医疗强求，其他行业放宽)
         total_revenue = info.get('totalRevenue', 0)
         rd_expense = info.get('researchAndDevelopment', 0)
         rd_ratio = rd_expense / total_revenue if total_revenue > 0 else 0
@@ -144,7 +130,6 @@ def analyze_fundamentals(symbol):
         if sector in {'Healthcare', 'Technology'} and rd_ratio < 0.08:
             return None
 
-        # 5. 组装结果
         reasons = (
             f"市值: {market_cap/1e8:.1f}亿美元 | "
             f"营收增速: {revenue_growth:.1%} | "
@@ -163,17 +148,16 @@ def analyze_fundamentals(symbol):
             '链接': f"https://finance.yahoo.com/quote/{symbol}"
         }
 
-    except Exception as e:
-        # 静默处理异常，保持输出干净
+    except Exception:
         return None
 
 def send_notifications(df):
-    """多平台推送模块 (支持微信、Telegram、飞书、钉钉)"""
+    """多平台推送模块 (加入精确的报错日志)"""
     if df.empty:
         print("📭 今日无符合双重严苛条件的标的，不发送通知。")
         return
         
-    summary = f"🚀 GrowthHunter V3.0 异动播报\n\n共捕获 {len(df)} 只高潜小盘股！\n\n"
+    summary = f"🚀 AI 驱动：GrowthHunter V3.1 异动播报\n\n共捕获 {len(df)} 只高潜小盘股！\n\n"
     for _, row in df.head(10).iterrows():
         summary += f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
     
@@ -181,75 +165,83 @@ def send_notifications(df):
     serverchan_key = os.getenv('SERVERCHAN_KEY')
     if serverchan_key:
         try:
-            requests.get(f"https://sctapi.ftqq.com/{serverchan_key}.send",
-                         params={"title": f"🚀 发现 {len(df)} 只异动 10 倍候选股", "desp": summary})
-            print("✅ 微信(Server酱)推送已发送")
-        except:
-            pass
+            res = requests.get(f"https://sctapi.ftqq.com/{serverchan_key}.send",
+                         params={"title": f"🚀 AI 发现 {len(df)} 只异动 10 倍候选股", "desp": summary})
+            if res.status_code == 200:
+                print("✅ 微信(Server酱)推送已发送")
+            else:
+                print(f"❌ 微信推送返回异常: {res.text}")
+        except Exception as e:
+            print(f"❌ 微信请求失败: {e}")
             
     # Telegram
     token = os.getenv('TELEGRAM_TOKEN')
     chat_id = os.getenv('TELEGRAM_CHAT_ID')
     if token and chat_id:
         try:
-            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+            res = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                           json={"chat_id": chat_id, "text": summary, "parse_mode": "Markdown"})
-            print("✅ Telegram推送已发送")
-        except:
-            pass
+            if res.status_code == 200:
+                print("✅ Telegram推送已发送")
+            else:
+                print(f"❌ Telegram推送异常: {res.text}")
+        except Exception as e:
+            print(f"❌ Telegram请求失败: {e}")
 
     # 飞书
     feishu_webhook = os.getenv('FEISHU_WEBHOOK')
     if feishu_webhook:
         try:
-            requests.post(feishu_webhook, json={"msg_type": "text", "content": {"text": summary}})
-            print("✅ 飞书推送已发送")
-        except:
-            pass
+            res = requests.post(feishu_webhook, json={"msg_type": "text", "content": {"text": summary}})
+            if res.status_code == 200:
+                print("✅ 飞书推送已发送")
+            else:
+                print(f"❌ 飞书推送异常: {res.text}")
+        except Exception as e:
+            print(f"❌ 飞书请求失败: {e}")
 
     # 钉钉
     dingtalk_webhook = os.getenv('DINGTALK_WEBHOOK')
     if dingtalk_webhook:
         try:
-            requests.post(dingtalk_webhook, json={"msgtype": "text", "text": {"content": summary}})
-            print("✅ 钉钉推送已发送")
-        except:
-            pass
+            res = requests.post(dingtalk_webhook, json={"msgtype": "text", "text": {"content": summary}})
+            # 钉钉正常返回是 200 且含有 errcode: 0
+            if res.status_code == 200 and res.json().get('errcode') == 0:
+                print("✅ 钉钉推送已发送")
+            else:
+                print(f"❌ 钉钉拒绝推送 (请检查机器人安全关键词设置): {res.text}")
+        except Exception as e:
+            print(f"❌ 钉钉请求报错: {e}")
 
 def test_notifications():
     """用于独立测试推送配置是否成功"""
     print("🔧 启动推送测试模式...")
+    # 这里的文本包含了常见自定义关键词，如：测试、通知、10倍股、播报、AI
     mock_data = [{
         '股票代码': 'TEST',
         '公司名称': '配置测试专用股',
         '市值(亿美元)': 88.8,
-        '筛选理由': '这是一条测试消息。如果你能看到这条消息，说明你的密钥和 Webhook 配置完全正确！🎉'
+        '筛选理由': 'AI 测试通知：如果你能看到这条消息，说明你的配置正确！(模拟播报 10倍股)'
     }]
     df = pd.DataFrame(mock_data)
     send_notifications(df)
-    print("✅ 测试推送指令已发出，请检查你的接收软件。")
+    print("✅ 测试推送指令发送完毕，请查看上方是否有 ❌ 报错。")
 
 def main():
     print("="*40)
     print(" 🚀 启动 GrowthHunter 量化重构版")
     print("="*40)
     
-    # 1. 获取基础股票池
     tickers = get_small_cap_tickers()
     if not tickers:
         return
-        
-    # 为了测试速度，你可以取消下面这行的注释，仅测试前 500 只股票
-    # tickers = tickers[:500] 
 
-    # 2. 第一阶段：批量技术面初筛 (极速)
     passed_tech_tickers = batch_technical_screen(tickers)
     
     if not passed_tech_tickers:
         print("🤷‍♂️ 第一阶段无任何标的满足趋势与异动要求，流程结束。")
         return
 
-    # 3. 第二阶段：基本面深研 (多线程)
     results = []
     print(f"⏳ 开始第二阶段：对初筛通过的 {len(passed_tech_tickers)} 只股票进行财务深挖...")
     
@@ -260,10 +252,8 @@ def main():
             if result:
                 results.append(result)
 
-    # 4. 结果处理
     df = pd.DataFrame(results)
     if not df.empty:
-        # 按市值从小到大排序，越小越有爆发力
         df = df.sort_values(by='市值(亿美元)') 
         df.to_csv('growth_hunter_results.csv', index=False, encoding='utf-8')
         
@@ -273,11 +263,10 @@ def main():
             f.write("**量化策略**：SuperTrend右侧 + 95分位爆量突破 + >20%营收增长 + 高研发驱动\n\n")
             f.write(df.to_markdown(index=False))
             
-        print(f"\n🎉 筛选大功告成！最终捕获 {len(results)} 只硬核标的，已生成 CSV 和 MD 报告。")
+        print(f"\n🎉 筛选大功告成！最终捕获 {len(results)} 只硬核标的。")
     else:
-        print("\n📉 遗憾：虽然有股票异动，但财务数据(增速/毛利)未达标，今日空仓。")
+        print("\n📉 遗憾：财务数据(增速/毛利)未达标，今日空仓。")
 
-    # 5. 推送通知
     send_notifications(df)
 
 if __name__ == "__main__":
