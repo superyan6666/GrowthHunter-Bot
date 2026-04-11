@@ -114,6 +114,10 @@ def batch_technical_screen(tickers):
             last_vol_95 = vol_95th.iloc[-1]
             last_vol_ma20 = vol_ma20.iloc[-1] # 新增
             
+            # 【安全补丁】：极致稳健防御，排除异常 NaN 值导致的逻辑崩溃
+            if pd.isna(current_vol) or pd.isna(last_vol_95) or pd.isna(last_vol_ma20):
+                continue
+            
             st_dir_cols = [col for col in df.columns if col.startswith('SUPERTd_')]
             if not st_dir_cols:
                 continue
