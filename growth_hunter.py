@@ -1,5 +1,5 @@
 """
-🚀 GrowthHunter V3.3 - 10倍股猎手 (第1步进化 + 严重Bug修复版)
+🚀 GrowthHunter V3.4 - 10倍股猎手 (第1步进化 + 稳定性优化版)
 依赖库安装: 
 pip install yfinance pandas pandas-ta requests tabulate
 """
@@ -11,6 +11,8 @@ from datetime import datetime
 import os
 import sys
 import requests
+import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
@@ -21,12 +23,16 @@ def get_small_cap_tickers():
     """获取小盘股代码：优先缓存 -> 实时 Russell 2000 -> 备用 S&P 600"""
     cache_path = 'small_cap_cache.csv'
     
+    # 【修正7】：缓存读取增加异常处理，防崩溃
     if os.path.exists(cache_path):
-        cache_age = (datetime.now() - datetime.fromtimestamp(os.path.getmtime(cache_path))).days
-        if cache_age < 7:
-            df = pd.read_csv(cache_path)
-            print(f"✅ 使用本地缓存小盘股池（{len(df)} 只）")
-            return df['Symbol'].tolist()
+        try:
+            cache_age = (datetime.now() - datetime.fromtimestamp(os.path.getmtime(cache_path))).days
+            if cache_age < 7:
+                df = pd.read_csv(cache_path)
+                print(f"✅ 使用本地缓存小盘股池（{len(df)} 只）")
+                return df['Symbol'].tolist()
+        except Exception as e:
+            print(f"⚠️ 缓存文件损坏或读取失败 ({e})，将重新拉取实时数据...")
 
     sources = [
         'https://stockanalysis.com/list/russell-2000/',
@@ -62,11 +68,9 @@ def batch_technical_screen(tickers):
     """
     print(f"⏳ 开始第一阶段：批量下载 {len(tickers)} 只股票及大盘基准(IWM)数据...")
     
-    # 注入 IWM 作为大盘强弱标尺
     download_list = tickers + ['IWM']
     data = yf.download(download_list, period="1y", group_by="ticker", threads=True, show_errors=False)
     
-    # 【修正1 & 修正2】：提取大盘基准收盘价，并安全剥离时区
     iwm_close = None
     if isinstance(data.columns, pd.MultiIndex) and 'IWM' in data.columns.get_level_values(0):
         iwm_close = data['IWM']['Close']
@@ -79,7 +83,6 @@ def batch_technical_screen(tickers):
     
     for sym in tickers:
         try:
-            # 【修正1】：安全的 MultiIndex 判断
             if isinstance(data.columns, pd.MultiIndex):
                 if sym not in data.columns.get_level_values(0):
                     continue
@@ -91,14 +94,13 @@ def batch_technical_screen(tickers):
             if len(df) < 150: 
                 continue
             
-            # 【修正2】：剥离个股时区，确保日期完美对齐
             df.index = df.index.tz_localize(None)
             
             # 计算超级趋势与爆量
             df.ta.supertrend(length=7, multiplier=3.0, append=True)
             vol_95th = df['Volume'].rolling(window=60).quantile(0.95)
             
-            # 【进化1：RS Line 相对强度计算】
+            # RS Line 相对强度计算
             rs_condition = True
             if iwm_close is not None:
                 aligned_iwm = iwm_close.reindex(df.index).ffill()
@@ -110,14 +112,12 @@ def batch_technical_screen(tickers):
             current_vol = df['Volume'].iloc[-1]
             last_vol_95 = vol_95th.iloc[-1]
             
-            # 【修正3】：防御性获取超级趋势方向列名
             st_dir_cols = [col for col in df.columns if col.startswith('SUPERTd_')]
             if not st_dir_cols:
                 continue
             st_dir_col = st_dir_cols[0]
             st_dir = df[st_dir_col].iloc[-1]
             
-            # 综合判定：上升趋势 + 爆量 + 跑赢大盘
             if st_dir == 1 and current_vol > last_vol_95 and rs_condition:
                 passed_tickers.append(sym)
                 
@@ -131,13 +131,15 @@ def analyze_fundamentals(symbol):
     """
     第二阶段漏斗：精准财务基本面过滤 (只对初筛通过的股票执行)
     """
+    # 【修正6】：防并发封禁，加入 0.5 ~ 2 秒随机休眠
+    time.sleep(random.uniform(0.5, 2.0))
+    
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.info
         if not info or 'longName' not in info:
             return None
 
-        # 【修正5】：市值上限严控至20亿美元，确保爆发力
         market_cap = info.get('marketCap', 0)
         if not (5e7 < market_cap < 2e9): 
             return None
@@ -145,7 +147,6 @@ def analyze_fundamentals(symbol):
         name = info.get('longName', symbol)
         sector = info.get('sector', '')
 
-        # 【修正4】：宽容处理财务缺失值，仅当明确不达标时剔除
         revenue_growth = info.get('revenueGrowth')
         if revenue_growth is not None and revenue_growth < 0.20:
             return None
@@ -161,7 +162,6 @@ def analyze_fundamentals(symbol):
         if sector in {'Healthcare', 'Technology'} and rd_ratio < 0.08:
             return None
 
-        # 格式化输出字符串，应对 None 值
         rg_str = f"{revenue_growth:.1%}" if revenue_growth is not None else "N/A"
         gm_str = f"{gross_margin:.1%}" if gross_margin is not None else "N/A"
 
@@ -187,14 +187,17 @@ def analyze_fundamentals(symbol):
         return None
 
 def send_notifications(df):
-    """多平台推送模块"""
+    """多平台推送模块 (含推送状态汇总)"""
     if df.empty:
         print("📭 今日无符合双重严苛条件的标的，不发送通知。")
         return
         
-    summary = f"🚀 AI 驱动：GrowthHunter V3.3 异动播报\n\n共捕获 {len(df)} 只跑赢大盘的高潜股！\n\n"
+    summary = f"🚀 AI 驱动：GrowthHunter V3.4 异动播报\n\n共捕获 {len(df)} 只跑赢大盘的高潜股！\n\n"
     for _, row in df.head(10).iterrows():
         summary += f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
+    
+    # 【修正8】：推送状态汇总清单
+    status_report = []
     
     # 微信 (Server酱)
     serverchan_key = os.getenv('SERVERCHAN_KEY')
@@ -203,13 +206,13 @@ def send_notifications(df):
             res = requests.get(f"https://sctapi.ftqq.com/{serverchan_key}.send",
                          params={"title": f"🚀 AI 发现 {len(df)} 只异动 10 倍候选股", "desp": summary})
             if res.status_code == 200:
-                print("✅ 微信(Server酱)推送已发送")
+                status_report.append("✅ 微信 (Server酱): 推送成功")
             else:
-                print(f"❌ 微信推送返回异常: {res.text}")
+                status_report.append(f"❌ 微信 (Server酱): 推送异常 ({res.text})")
         except Exception as e:
-            print(f"❌ 微信请求失败: {e}")
+            status_report.append(f"❌ 微信 (Server酱): 请求失败 ({e})")
     else:
-        print("⚠️ 微信(Server酱)推送跳过：未配置 SERVERCHAN_KEY")
+        status_report.append("⚪ 微信 (Server酱): 未配置，跳过")
             
     # Telegram
     token = os.getenv('TELEGRAM_TOKEN')
@@ -219,13 +222,13 @@ def send_notifications(df):
             res = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                           json={"chat_id": chat_id, "text": summary, "parse_mode": "Markdown"})
             if res.status_code == 200:
-                print("✅ Telegram推送已发送")
+                status_report.append("✅ Telegram: 推送成功")
             else:
-                print(f"❌ Telegram推送异常: {res.text}")
+                status_report.append(f"❌ Telegram: 推送异常 ({res.text})")
         except Exception as e:
-            print(f"❌ Telegram请求失败: {e}")
+            status_report.append(f"❌ Telegram: 请求失败 ({e})")
     else:
-        print("⚠️ Telegram推送跳过：未配置 TELEGRAM_TOKEN 或 TELEGRAM_CHAT_ID")
+        status_report.append("⚪ Telegram: 未配置，跳过")
 
     # 飞书
     feishu_webhook = os.getenv('FEISHU_WEBHOOK')
@@ -233,13 +236,13 @@ def send_notifications(df):
         try:
             res = requests.post(feishu_webhook, json={"msg_type": "text", "content": {"text": summary}})
             if res.status_code == 200:
-                print("✅ 飞书推送已发送")
+                status_report.append("✅ 飞书: 推送成功")
             else:
-                print(f"❌ 飞书推送异常: {res.text}")
+                status_report.append(f"❌ 飞书: 推送异常 ({res.text})")
         except Exception as e:
-            print(f"❌ 飞书请求失败: {e}")
+            status_report.append(f"❌ 飞书: 请求失败 ({e})")
     else:
-        print("⚠️ 飞书推送跳过：未配置 FEISHU_WEBHOOK")
+        status_report.append("⚪ 飞书: 未配置，跳过")
 
     # 钉钉
     dingtalk_webhook = os.getenv('DINGTALK_WEBHOOK')
@@ -247,13 +250,21 @@ def send_notifications(df):
         try:
             res = requests.post(dingtalk_webhook, json={"msgtype": "text", "text": {"content": summary}})
             if res.status_code == 200 and res.json().get('errcode') == 0:
-                print("✅ 钉钉推送已发送")
+                status_report.append("✅ 钉钉: 推送成功")
             else:
-                print(f"❌ 钉钉拒绝推送 (请检查机器人安全关键词设置): {res.text}")
+                status_report.append(f"❌ 钉钉: 被拒绝 (可能缺少关键词 'AI') - {res.text}")
         except Exception as e:
-            print(f"❌ 钉钉请求报错: {e}")
+            status_report.append(f"❌ 钉钉: 请求失败 ({e})")
     else:
-        print("⚠️ 钉钉推送跳过：未配置 DINGTALK_WEBHOOK (系统未检测到该环境变量)")
+        status_report.append("⚪ 钉钉: 未配置，跳过")
+
+    # 打印最终的推送汇总面板
+    print("\n" + "="*35)
+    print(" 📢 推送状态汇总")
+    print("="*35)
+    for status in status_report:
+        print(status)
+    print("="*35 + "\n")
 
 def test_notifications():
     """用于独立测试推送配置是否成功"""
@@ -262,15 +273,14 @@ def test_notifications():
         '股票代码': 'TEST',
         '公司名称': '配置测试专用股',
         '市值(亿美元)': 88.8,
-        '筛选理由': 'AI 测试通知：Bug修补完成！如果你能看到这条消息，说明你的配置正确。'
+        '筛选理由': 'AI 测试通知：反爬与稳定性Bug修补完成！如果你能看到这条消息，说明你的配置正确。'
     }]
     df = pd.DataFrame(mock_data)
     send_notifications(df)
-    print("✅ 测试推送指令发送完毕，请查看上方是否有 ❌ 报错或 ⚠️ 警告。")
 
 def main():
     print("="*40)
-    print(" 🚀 启动 GrowthHunter V3.3 (RS增强 + Bug修复版)")
+    print(" 🚀 启动 GrowthHunter V3.4 (稳定性增强版)")
     print("="*40)
     
     tickers = get_small_cap_tickers()
@@ -286,7 +296,8 @@ def main():
     results = []
     print(f"⏳ 开始第二阶段：对初筛通过的 {len(passed_tech_tickers)} 只股票进行财务深挖...")
     
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # 【修正6】：将并发数降至 4，配合前面的 random sleep，避免触发封禁
+    with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_symbol = {executor.submit(analyze_fundamentals, sym): sym for sym in passed_tech_tickers}
         for future in as_completed(future_to_symbol):
             result = future.result()
