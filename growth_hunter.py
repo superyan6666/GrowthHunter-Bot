@@ -99,6 +99,7 @@ def batch_technical_screen(tickers):
             # 计算超级趋势与爆量
             df.ta.supertrend(length=7, multiplier=3.0, append=True)
             vol_95th = df['Volume'].rolling(window=60).quantile(0.95)
+            vol_ma20 = df['Volume'].rolling(window=20).mean() # 新增：20日均量辅助判断
             
             # RS Line 相对强度计算
             rs_condition = True
@@ -111,6 +112,7 @@ def batch_technical_screen(tickers):
 
             current_vol = df['Volume'].iloc[-1]
             last_vol_95 = vol_95th.iloc[-1]
+            last_vol_ma20 = vol_ma20.iloc[-1] # 新增
             
             st_dir_cols = [col for col in df.columns if col.startswith('SUPERTd_')]
             if not st_dir_cols:
@@ -118,7 +120,8 @@ def batch_technical_screen(tickers):
             st_dir_col = st_dir_cols[0]
             st_dir = df[st_dir_col].iloc[-1]
             
-            if st_dir == 1 and current_vol > last_vol_95 and rs_condition:
+            # 综合判定：上升趋势 + 爆量 (增加 >1.5倍20日均量的双重限制) + 跑赢大盘
+            if st_dir == 1 and current_vol > last_vol_95 and current_vol > last_vol_ma20 * 1.5 and rs_condition:
                 passed_tickers.append(sym)
                 
         except Exception:
@@ -156,20 +159,27 @@ def analyze_fundamentals(symbol):
             return None
 
         total_revenue = info.get('totalRevenue', 0)
-        rd_expense = info.get('researchAndDevelopment', 0)
-        rd_ratio = rd_expense / total_revenue if total_revenue > 0 else 0
+        rd_expense = info.get('researchAndDevelopment')
         
-        if sector in {'Healthcare', 'Technology'} and rd_ratio < 0.08:
+        # 宽容处理研发费用缺失，防误杀
+        if rd_expense is None:
+            rd_ratio = None
+        else:
+            rd_ratio = rd_expense / total_revenue if total_revenue > 0 else 0
+        
+        # 仅当数据存在且不达标时才剔除
+        if sector in {'Healthcare', 'Technology'} and rd_ratio is not None and rd_ratio < 0.08:
             return None
 
         rg_str = f"{revenue_growth:.1%}" if revenue_growth is not None else "N/A"
         gm_str = f"{gross_margin:.1%}" if gross_margin is not None else "N/A"
+        rd_str = f"{rd_ratio:.1%}" if rd_ratio is not None else "N/A"
 
         reasons = (
             f"市值: {market_cap/1e8:.1f}亿 | "
             f"营收增速: {rg_str} | "
             f"毛利率: {gm_str} | "
-            f"研发: {rd_ratio:.1%} | "
+            f"研发: {rd_str} | "
             f"异动信号: 趋势向上 + 爆量 + RS跑赢大盘"
         )
 
@@ -196,6 +206,11 @@ def send_notifications(df):
     for _, row in df.head(10).iterrows():
         summary += f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
     
+    # 消息防超长安全截断 (避免触发 Server酱 等 64KB 限制)
+    max_len = 10000 
+    if len(summary) > max_len:
+        summary = summary[:max_len] + "\n\n...（内容过长已自动截断）"
+        
     # 【修正8】：推送状态汇总清单
     status_report = []
     
