@@ -2,7 +2,8 @@ name: 🚀 每日运行 GrowthHunter
 
 on:
   schedule:
-    - cron: '30 20 * * 1-5' # 周一到周五运行
+    # [修复时区与数据延迟] 调整为 UTC 22:30 (北京时间次日凌晨 6:30)，确保 Yahoo 日线数据已完全刷新就绪
+    - cron: '30 22 * * 1-5'
   workflow_dispatch:
     inputs:
       test_mode:
@@ -11,24 +12,58 @@ on:
         type: boolean
         default: false
 
+# 【防并发冲突】如果已经有正在运行的任务，自动取消旧任务或排队
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 【DevOps 最佳实践】：显式声明工作流权限，遵循最小权限原则
+permissions:
+  contents: read      # 仅允许读取代码库内容
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    # 【健壮性优化】：设置最高运行时长，防止网络死锁导致 Actions 免费额度被耗尽
+    timeout-minutes: 120
 
     steps:
     - name: 检出代码
-      uses: actions/checkout@v4  # [修复警告] 升级到 v4
+      uses: actions/checkout@v4
 
     - name: 设置 Python 环境
-      uses: actions/setup-python@v5  # [修复警告] 升级到 v5
+      uses: actions/setup-python@v5
       with:
         python-version: '3.12'
 
-    - name: 安装依赖包
-      # [修复报错] 直接在这里安装所有需要的包，包含生成 Markdown 必须的 tabulate
+    # 【性能优化】：缓存 pip 依赖库，hash 键绑定当前 yaml 文件
+    - name: 缓存 Python 依赖
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('.github/workflows/run_hunter.yml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: 环境检查与依赖安装
+      # [细节优化] 打印 python 和 pip 版本，方便未来排错
       run: |
+        python --version
+        pip --version
         python -m pip install --upgrade pip
         pip install yfinance pandas pandas-ta requests lxml html5lib tabulate
+
+    # 【终极补丁：记忆继承】从上一次成功的运行中下载历史数据库和缓存，实现真正的跨日增量存储
+    - name: ⬇️ 下载历史数据库与股票池缓存
+      uses: dawidd6/action-download-artifact@v3
+      continue-on-error: true  # 第一次运行没有历史记录，允许失败继续
+      with:
+        github_token: ${{secrets.GITHUB_TOKEN}}
+        workflow: run_hunter.yml
+        workflow_conclusion: success
+        name_is_regexp: true
+        name: growth-hunter-artifacts-.*
+        path: .
 
     - name: 运行量化程序
       env:
@@ -45,3 +80,18 @@ jobs:
           echo "执行全量股票筛选..."
           python growth_hunter.py
         fi
+
+    # 【终极补丁：修复 Git 仓库膨胀与冲突】将二进制数据库和报告改为 GitHub Artifacts 归档
+    - name: 上传归档数据与报告为构建产物
+      # [细节优化] 仅在非测试模式下上传，避免产生毫无意义的空文件占用空间
+      if: ${{ inputs.test_mode != 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        # [细节优化] 添加 run_number，使每次构建生成的 Artifact 拥有独一无二的名字，美观且易于追溯
+        name: growth-hunter-artifacts-${{ github.run_number }}
+        path: |
+          growth_hunter_signals.db
+          growth_hunter_results.csv
+          growth_hunter_results.md
+          small_cap_cache.csv
+        retention-days: 90
