@@ -790,8 +790,10 @@ def test_notifications():
     mock_backtest = "\n📊 【系统自动复盘战报】\n • T+1 (10-24推 3只): 胜率 67% | 平均收益 +4.2%\n • T+5 (10-18推 5只): 胜率 80% | 平均收益 +12.5%\n"
     send_notifications(df, mock_backtest)
 
-def main():
+def main(dry_run=False):
     logging.info("="*40 + " 🚀 GrowthHunter V7.0-AB (内幕交易 + 自动复盘引擎) " + "="*40)
+    if dry_run:
+        logging.info("🏃 【DRY-RUN 空跑模式启动】：仅选股，跳过数据库写入与推送。")
     
     # 1. 初始化归档数据库
     init_db()
@@ -815,32 +817,42 @@ def main():
 
     df = pd.DataFrame(results)
     if not df.empty:
-        df = df.sort_values(by='市值(亿美元)')
+        # 【体验优化】：按综合得分降序、市值升序排列，并为 Markdown 报告增加超链接
+        df = df.sort_values(by=['综合得分', '市值(亿美元)'], ascending=[False, True])
+        
+        md_df = df.copy()
+        md_df['股票代码'] = md_df['股票代码'].apply(lambda x: f"[{x}](https://finance.yahoo.com/quote/{x})")
         
         # 4. 保存为本地 csv 和 markdown 报告
         df.to_csv('growth_hunter_results.csv', index=False)
-        try: md_table = df.to_markdown(index=False)
-        except: md_table = df.to_string(index=False)
+        try: md_table = md_df.to_markdown(index=False)
+        except: md_table = md_df.to_string(index=False)
         with open('growth_hunter_results.md', 'w', encoding='utf-8') as f:
             f.write(f"# 🚀 GrowthHunter 严选报告\n\n**生成时间**：{datetime.now()}\n\n{md_table}")
         
         logging.info(f"🎉 大功告成！捕获 {len(results)} 只硬核标的。")
         
-        # 5. 写入 SQLite 数据库档案
-        save_signals_to_db(df)
+        if not dry_run:
+            # 5. 写入 SQLite 数据库档案
+            save_signals_to_db(df)
     else: 
         logging.info("📉 今日无新增达标标的。")
     
-    # 6. 【新增核心能力】：执行历史标的自动复盘战报
-    backtest_report = run_auto_backtest()
-    
-    # 7. 发送多平台通知 (合并新标的与历史战报)
-    send_notifications(df, backtest_report)
+    if not dry_run:
+        # 6. 【新增核心能力】：执行历史标的自动复盘战报
+        backtest_report = run_auto_backtest()
+        
+        # 7. 发送多平台通知 (合并新标的与历史战报)
+        send_notifications(df, backtest_report)
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) > 1 and sys.argv[1] == '--test': test_notifications()
-        else: main()
+        if len(sys.argv) > 1 and sys.argv[1] == '--test': 
+            test_notifications()
+        elif len(sys.argv) > 1 and sys.argv[1] == '--dry-run': 
+            main(dry_run=True)
+        else: 
+            main()
     finally:
         # 【稳健性优化】：优雅地回收全局线程池资源，wait=True 确保所有正在执行的 I/O 任务安全结束
         shared_io_executor.shutdown(wait=True)
