@@ -52,11 +52,12 @@ jobs:
 
     - name: 环境检查与依赖安装
       # [细节优化] 打印 python 和 pip 版本，方便未来排错
+      # [V9.0 升级] 追加了 google-generativeai 库，提供大模型支持
       run: |
         python --version
         pip --version
         python -m pip install --upgrade pip
-        pip install yfinance pandas pandas-ta requests lxml html5lib tabulate
+        pip install yfinance pandas pandas-ta requests lxml html5lib tabulate google-generativeai
 
     # 【终极补丁：记忆继承】从上一次成功的运行中下载历史数据库和缓存，实现真正的跨日增量存储
     - name: ⬇️ 下载历史数据库与股票池缓存
@@ -71,12 +72,14 @@ jobs:
         path: .
 
     - name: 运行量化程序
+      # [V9.0 升级] 挂载 GEMINI_API_KEY，激活 AI 语义大脑
       env:
         SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
         DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       run: |
         if [ "${{ inputs.test_mode }}" == "true" ]; then
           echo "检测到测试模式，执行推送测试..."
