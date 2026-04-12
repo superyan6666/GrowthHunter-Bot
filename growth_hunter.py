@@ -1,6 +1,7 @@
 """
 🚀 GrowthHunter V7.0-ABC - 10倍股猎手 (全量终极版)
 策略进化：期权异动 + NLP新闻 + 高管抄底 + 自动复盘 + 🩸 世纪轧空雷达 (Short Squeeze)
+扩展特性：支持自定义 CSV 股票池输入、每日全局表现 SQLite 统计打点
 """
 
 import yfinance as yf
@@ -17,6 +18,7 @@ import re
 import sqlite3
 import logging
 import atexit
+import argparse
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import warnings
@@ -72,7 +74,7 @@ def get_session():
 # 终极模块 C：SQLite 本地信号归档数据库
 # ==========================================
 def init_db():
-    """初始化本地 SQLite 数据库，建立信号档案库"""
+    """初始化本地 SQLite 数据库，建立信号档案库及全局统计表"""
     conn = sqlite3.connect('growth_hunter_signals.db')
     c = conn.cursor()
     c.execute('''
@@ -96,20 +98,31 @@ def init_db():
             c.execute(f'ALTER TABLE signals ADD COLUMN {col} TEXT')
         except sqlite3.OperationalError:
             pass # 列已存在
+            
+    # 【新增功能】：建立每日全局运行表现统计表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS daily_stats (
+            date TEXT PRIMARY KEY,
+            tickers_scanned INTEGER,
+            passed_tech INTEGER,
+            final_selected INTEGER,
+            avg_score REAL
+        )
+    ''')
         
-    # 【细节优化】：为查询高频列建立独立索引，提升后期自动复盘的检索速度
     c.execute('CREATE INDEX IF NOT EXISTS idx_date ON signals (date)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_symbol ON signals (symbol)')
     conn.commit()
     conn.close()
 
-def save_signals_to_db(df):
-    """将当天的有效信号保存进数据库，用于后期自动复盘"""
+def save_signals_to_db(df, tickers_scanned_count, passed_tech_count):
+    """将当天的有效信号及全局统计表现保存进数据库"""
     try:
         conn = sqlite3.connect('growth_hunter_signals.db')
         today = datetime.now().strftime('%Y-%m-%d')
+        
+        # 1. 保存个股信号
         for _, row in df.iterrows():
-            # 使用 ON CONFLICT DO UPDATE 实现 Upsert，完美解决同一天重跑时旧记录无法更新的问题
             conn.execute('''
                 INSERT INTO signals 
                 (date, symbol, name, market_cap, revenue_growth, f_score, options_flow, catalyst, close_price, insider_trading, short_squeeze)
@@ -124,9 +137,22 @@ def save_signals_to_db(df):
             ''', (today, row['股票代码'], row['公司名称'], row['市值(亿美元)'], 
                   row['营收增速'], row['F-Score'], row['期权异动'], row['催化剂'], 
                   row.get('最新收盘价', 0.0), row.get('内幕交易', '未知'), row.get('轧空雷达', '未知')))
+                  
+        # 2. 保存全局统计表
+        avg_score = round(df['综合得分'].mean(), 2) if not df.empty else 0.0
+        conn.execute('''
+            INSERT INTO daily_stats (date, tickers_scanned, passed_tech, final_selected, avg_score)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(date) DO UPDATE SET
+                tickers_scanned=excluded.tickers_scanned,
+                passed_tech=excluded.passed_tech,
+                final_selected=excluded.final_selected,
+                avg_score=excluded.avg_score
+        ''', (today, tickers_scanned_count, passed_tech_count, len(df), avg_score))
+        
         conn.commit()
         conn.close()
-        logging.info("💾 信号已成功归档至本地 SQLite 数据库 (growth_hunter_signals.db)")
+        logging.info("💾 信号与运行统计已成功归档至本地 SQLite 数据库")
     except Exception as e:
         logging.error(f"⚠️ 数据库保存失败: {e}")
 
@@ -280,8 +306,29 @@ def analyze_catalyst(symbol):
     except Exception:
         return "获取失败"
 
-def get_small_cap_tickers():
-    """获取小盘股代码：优先缓存 -> 实时 Russell 2000 -> 备用 S&P 600"""
+def get_small_cap_tickers(input_file=None):
+    """获取小盘股代码：自定义输入 -> 优先缓存 -> 实时 Russell 2000 -> 备用 S&P 600"""
+    
+    # 【新增能力】：支持读取用户传入的自定义股票池 CSV
+    if input_file:
+        if os.path.exists(input_file):
+            try:
+                df = pd.read_csv(input_file, header=None)
+                # 兼容包含 Header 'Symbol' 或无 Header 的单列 CSV
+                if 'Symbol' in df.values:
+                    df = pd.read_csv(input_file)
+                    tickers = df['Symbol'].dropna().astype(str).tolist()
+                else:
+                    tickers = df.iloc[:, 0].dropna().astype(str).tolist()
+                
+                tickers = [t.strip().upper() for t in tickers if t.strip()]
+                logging.info(f"📂 成功读取自定义股票池: {input_file} ({len(tickers)} 只)")
+                return tickers
+            except Exception as e:
+                logging.error(f"❌ 读取自定义文件失败 ({e})，将回退至默认策略...")
+        else:
+            logging.error(f"❌ 自定义文件不存在: {input_file}，将回退至默认策略...")
+
     cache_path = 'small_cap_cache.csv'
     
     if os.path.exists(cache_path):
@@ -620,6 +667,14 @@ def analyze_fundamentals(symbol, close_price=0.0):
             # 【终极方向 C：世纪轧空雷达】直接从 info 中极速提取，0 额外耗时
             short_float = info.get('shortPercentOfFloat')
             short_ratio = info.get('shortRatio', 'N/A')
+            
+            # 【鲁棒性增强】：备选逻辑计算做空比例
+            if short_float is None:
+                short_int = info.get('shortInterest')
+                shares_out = info.get('sharesOutstanding') or info.get('impliedSharesOutstanding')
+                if short_int and shares_out and shares_out > 0:
+                    short_float = short_int / shares_out
+
             squeeze_signal = "无"
             if short_float is not None:
                 if short_float >= Config.SHORT_FLOAT_MIN:
@@ -843,19 +898,19 @@ def test_notifications():
     init_db()
     mock_data = [{'股票代码': 'TEST', '公司名称': '配置测试股', '市值(亿美元)': 8.8, '营收增速': '50%', 'F-Score': '9/9', '综合得分': 7, '期权异动': '🔥 看涨爆单', '催化剂': '🚀 利好 (TEST Q3 Beat...)', '内幕交易': '🚨 高管净买入 (2笔)', '轧空雷达': '🩸 世纪轧空 (空头占比: 25.5%, 回补天数: 6.2)', '最新收盘价': 100.5, '筛选理由': 'V7.0-ABC 系统全栈就绪！\n  └ 🩸 轧空: 🩸 世纪轧空 (空头占比: 25.5%, 回补天数: 6.2)'}]
     df = pd.DataFrame(mock_data)
-    save_signals_to_db(df)
+    save_signals_to_db(df, 1, 1) # 传入模拟统计数字
     
     mock_backtest = "\n📊 【系统自动复盘战报】\n • T+1 (10-24推 3只): 胜率 67% | 平均收益 +4.2%\n • T+5 (10-18推 5只): 胜率 80% | 平均收益 +12.5%\n"
     send_notifications(df, mock_backtest)
 
-def main(dry_run=False):
+def main(dry_run=False, input_file=None):
     logging.info("="*40 + " 🚀 GrowthHunter V7.0-ABC (全量终极版) " + "="*40)
     if dry_run:
         logging.info("🏃 【DRY-RUN 空跑模式启动】：仅选股，跳过数据库写入与推送。")
     
     init_db()
     
-    tickers = get_small_cap_tickers()
+    tickers = get_small_cap_tickers(input_file=input_file)
     if not tickers: return
 
     passed_tech_tickers, close_prices_dict = batch_technical_screen(tickers)
@@ -886,21 +941,30 @@ def main(dry_run=False):
         logging.info(f"🎉 大功告成！捕获 {len(results)} 只硬核标的。")
         
         if not dry_run:
-            save_signals_to_db(df)
+            # 记录全链路数据到 DB
+            save_signals_to_db(df, len(tickers), len(passed_tech_tickers))
     else: 
         logging.info("📉 今日无新增达标标的。")
+        if not dry_run:
+            save_signals_to_db(pd.DataFrame(), len(tickers), len(passed_tech_tickers))
     
     if not dry_run:
         backtest_report = run_auto_backtest()
         send_notifications(df, backtest_report)
 
 if __name__ == "__main__":
+    # 【架构重构】：引入标准的 argparse 处理命令行输入，替代 sys.argv 硬编码
+    parser = argparse.ArgumentParser(description="🚀 GrowthHunter V7.0-ABC 量化引擎")
+    parser.add_argument('--test', action='store_true', help="运行推送测试模式")
+    parser.add_argument('--dry-run', action='store_true', help="空跑模式（不落库、不推送）")
+    parser.add_argument('--input', type=str, default=None, help="自定义股票池 CSV 路径 (支持单列代码，无需表头)")
+    
+    args, unknown = parser.parse_known_args()
+    
     try:
-        if len(sys.argv) > 1 and sys.argv[1] == '--test': 
+        if args.test:
             test_notifications()
-        elif len(sys.argv) > 1 and sys.argv[1] == '--dry-run': 
-            main(dry_run=True)
-        else: 
-            main()
+        else:
+            main(dry_run=args.dry_run, input_file=args.input)
     finally:
         pass # atexit 已接管线程池释放，保持代码结构规整
