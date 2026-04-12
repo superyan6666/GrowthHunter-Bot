@@ -11,6 +11,11 @@ on:
         required: false
         type: boolean
         default: false
+      dry_run:
+        description: '🏃 空跑模式 (仅选股，不发推送，不写数据库)'
+        required: false
+        type: boolean
+        default: false
 
 # 【防并发冲突】如果已经有正在运行的任务，自动取消旧任务或排队
 concurrency:
@@ -76,6 +81,9 @@ jobs:
         if [ "${{ inputs.test_mode }}" == "true" ]; then
           echo "检测到测试模式，执行推送测试..."
           python growth_hunter.py --test
+        elif [ "${{ inputs.dry_run }}" == "true" ]; then
+          echo "执行空跑模式 (Dry Run)..."
+          python growth_hunter.py --dry-run
         else
           echo "执行全量股票筛选..."
           python growth_hunter.py
@@ -83,8 +91,8 @@ jobs:
 
     # 【终极补丁：修复 Git 仓库膨胀与冲突】将二进制数据库和报告改为 GitHub Artifacts 归档
     - name: 上传归档数据与报告为构建产物
-      # [细节优化] 仅在非测试模式下上传，避免产生毫无意义的空文件占用空间
-      if: ${{ inputs.test_mode != 'true' }}
+      # [细节优化] 仅在非测试/非空跑模式下上传，避免产生毫无意义的空文件占用空间
+      if: ${{ inputs.test_mode != 'true' && inputs.dry_run != 'true' }}
       uses: actions/upload-artifact@v4
       with:
         # [细节优化] 添加 run_number，使每次构建生成的 Artifact 拥有独一无二的名字，美观且易于追溯
