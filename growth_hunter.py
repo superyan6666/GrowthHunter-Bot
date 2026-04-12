@@ -58,6 +58,9 @@ def init_db():
             UNIQUE(date, symbol)
         )
     ''')
+    # 【细节优化】：为查询高频列建立独立索引，提升后期自动复盘的检索速度
+    c.execute('CREATE INDEX IF NOT EXISTS idx_date ON signals (date)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_symbol ON signals (symbol)')
     conn.commit()
     conn.close()
 
@@ -117,7 +120,8 @@ def analyze_options_flow(ticker):
         pcr = put_vol / call_vol if call_vol > 0 else 9.9
         
         # 寻找看涨期权异常爆单：成交量(volume)大于未平仓量(openInterest)
-        unusual_calls = calls[(calls['volume'] > 0) & (calls['openInterest'] > 0) & (calls['volume'] > calls['openInterest'] * 1.5)]
+        # 【修复】：加入绝对门槛 (volume > 100)，剔除垃圾合约（如 OI=1, Volume=2）触发的伪挤压信号
+        unusual_calls = calls[(calls['volume'] > 100) & (calls['openInterest'] > 0) & (calls['volume'] > calls['openInterest'] * 1.5)]
         
         if not unusual_calls.empty and pcr < 0.7:
             return f"🔥 看涨爆单 (PCR: {pcr:.2f})"
@@ -133,13 +137,27 @@ def analyze_options_flow(ticker):
 # ==========================================
 def analyze_catalyst(ticker):
     """基于内置词典的极速 NLP 新闻标题情绪打分"""
+    def _fetch_news():
+        return ticker.news
+
     try:
-        news = ticker.news
+        # 【性能优化9】：为新闻拉取增加独立超时控制，防止无限挂起拖死整个线程池
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_fetch_news)
+            try:
+                # 设定 5 秒强行超时限制
+                news = future.result(timeout=5)
+            except TimeoutError:
+                return "请求超时"
+            except Exception:
+                return "获取失败"
+                
         if not news: return "无最新消息"
         
-        # 轻量级情绪词库
-        pos_words = ['beat', 'surge', 'upgrade', 'fda', 'acquire', 'buy', 'profit', 'record', 'high', 'breakout', 'partner', 'approval']
-        neg_words = ['miss', 'downgrade', 'lawsuit', 'investigate', 'offering', 'dilution', 'decline', 'drop', 'cut', 'warning', 'reject']
+        # 移除了易误判的模糊词(如 high, drop, cut)，保留高确定性动作词
+        pos_words = ['beat', 'surge', 'upgrade', 'fda', 'acquire', 'buy', 'profit', 'record', 'breakout', 'partner', 'approval']
+        neg_words = ['miss', 'downgrade', 'lawsuit', 'investigate', 'offering', 'dilution', 'decline', 'warning', 'reject', 'fail', 'penalty']
+        negation_context = ['not', 'fail', 'miss'] # 极简否定语境
         
         score = 0
         latest_title = news[0].get('title', '无标题')
@@ -147,8 +165,15 @@ def analyze_catalyst(ticker):
         # 扫描最近 3 条新闻判定综合情绪
         for n in news[:3]:
             title = n.get('title', '').lower()
-            if any(w in title for w in pos_words): score += 1
-            if any(w in title for w in neg_words): score -= 1
+            
+            # 若包含正向词，但同一句存在否定/失败语境，则忽略利好
+            has_pos = any(w in title for w in pos_words)
+            has_negation = any(neg in title for neg in negation_context)
+            
+            if has_pos and not has_negation: 
+                score += 1
+            if any(w in title for w in neg_words): 
+                score -= 1
         
         short_title = latest_title[:25] + "..." if len(latest_title) > 25 else latest_title
         
@@ -546,17 +571,18 @@ def send_notifications(df):
             continue
         try:
             if platform == '微信':
-                res = requests.get(f"https://sctapi.ftqq.com/{val}.send", params={"title": "🚀 V6 终极起爆预警", "desp": summary})
+                res = requests.get(f"https://sctapi.ftqq.com/{val}.send", params={"title": "🚀 V6 终极起爆预警", "desp": summary}, timeout=10)
             elif platform == 'Telegram':
                 chat_id = os.getenv('TELEGRAM_CHAT_ID')
                 if not chat_id:
                     status_report.append(f"⚪ Telegram: 未配置 CHAT_ID")
                     continue
-                tg_summary = re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', summary)
-                res = requests.post(f"https://api.telegram.org/bot{val}/sendMessage", json={"chat_id": chat_id, "text": tg_summary, "parse_mode": "MarkdownV2"})
+                # 恢复至经典的 Markdown (V1) 并仅转义少量可能破坏格式的字符，确保 URL 绝对安全可解析
+                tg_summary = summary.replace('_', '\\_').replace('*', '\\*')
+                res = requests.post(f"https://api.telegram.org/bot{val}/sendMessage", json={"chat_id": chat_id, "text": tg_summary, "parse_mode": "Markdown"}, timeout=10)
             else:
                 payload = {"msg_type": "text", "content": {"text": summary}} if platform == '飞书' else {"msgtype": "text", "text": {"content": summary}}
-                res = requests.post(val, json=payload)
+                res = requests.post(val, json=payload, timeout=10)
                 
             if res.status_code == 200: status_report.append(f"✅ {platform}: 成功")
             else: status_report.append(f"❌ {platform}: 异常 ({res.text})")
@@ -570,7 +596,7 @@ def send_notifications(df):
 def test_notifications():
     print("🔧 启动推送测试模式...")
     init_db() # 测试顺便初始化数据库
-    mock_data = [{'股票代码': 'TEST', '公司名称': '配置测试股', '市值(亿美元)': 8.8, '营收增速': '50%', 'F-Score': '9/9', '期权异动': '🔥 看涨爆单', '催化剂': '🚀 利好 (TEST Q3 Beat...)', '筛选理由': 'V6.0 霸王龙全栈系统就绪！'}]
+    mock_data = [{'股票代码': 'TEST', '公司名称': '配置测试股', '市值(亿美元)': 8.8, '营收增速': '50%', 'F-Score': '9/9', '期权异动': '🔥 看涨爆单', '催化剂': '🚀 利好 (TEST Q3 Beat...)', '最新收盘价': 100.5, '筛选理由': 'V6.0 霸王龙全栈系统就绪！'}]
     df = pd.DataFrame(mock_data)
     save_signals_to_db(df)
     send_notifications(df)
