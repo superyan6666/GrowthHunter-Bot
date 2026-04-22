@@ -23,8 +23,9 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import warnings
 
+# 适配 Google 最新的 genai SDK
 try:
-    import google.generativeai as genai
+    from google import genai
     HAS_GENAI = True
 except ImportError:
     HAS_GENAI = False
@@ -83,8 +84,8 @@ def check_macro_regime():
     """大盘政权校验，多维防守（红绿黄三级政权）"""
     logging.info("🌍 启动风控系统：扫描宏观大盘政权 (Macro Regime)...")
     try:
-        # 获取三大宏观风控标的
-        macro_data = yf.download(["SPY", "IWM", "^VIX"], period="1y", group_by="ticker", show_errors=False, progress=False)
+        # 移除已弃用的 show_errors 参数
+        macro_data = yf.download(["SPY", "IWM", "^VIX"], period="1y", group_by="ticker", progress=False)
         if macro_data.empty: 
             return 'GREEN', "无法获取大盘数据，默认放行"
             
@@ -276,7 +277,7 @@ def analyze_options_flow(symbol):
     except Exception: return "获取失败"
 
 def analyze_catalyst(symbol):
-    """大模型 JSON 结构化提取，多维打标、致命排雷与指数退避重试兜底"""
+    """大模型 JSON 结构化提取，多维打标、致命排雷与指数退避重试兜底 (适配最新 genai SDK)"""
     try:
         news = shared_io_executor.submit(lambda: yf.Ticker(symbol, session=get_session()).news).result(timeout=5)
         if not news: return "无最新消息"
@@ -288,8 +289,8 @@ def analyze_catalyst(symbol):
         if api_key and HAS_GENAI:
             for attempt in range(3):  # AI 重试与指数退避兜底机制
                 try:
-                    genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    # 采用最新版 SDK 语法
+                    client = genai.Client(api_key=api_key)
                     news_text = "\n".join([f"- {n.get('title', '')}: {n.get('summary', '')}" for n in news[:5]])
                     prompt = f"""作为资深量化风控官与分析师，阅读股票 {symbol} 的近期新闻：
 {news_text}
@@ -301,7 +302,11 @@ def analyze_catalyst(symbol):
   "red_flag": "发现的具体致命风险(如增发/诉讼/退市等)，若无请严格填 null",
   "summary": "限15个汉字的核心逻辑总结"
 }}"""
-                    res_text = model.generate_content(prompt).text.strip()
+                    response = client.models.generate_content(
+                        model='gemini-1.5-flash',
+                        contents=prompt
+                    )
+                    res_text = response.text.strip()
                     
                     # 修复截断问题：清除 Markdown JSON 标记
                     bt = '`' * 3
@@ -403,7 +408,8 @@ def batch_technical_screen(tickers):
     
     data = None
     for _ in range(3):
-        data = yf.download(download_list, period="1y", group_by="ticker", threads=True, show_errors=False)
+        # 移除已弃用的 show_errors 参数
+        data = yf.download(download_list, period="1y", group_by="ticker", threads=True)
         if data is not None and not data.empty: break
         time.sleep(3)
     
@@ -729,7 +735,8 @@ def run_auto_backtest():
         if not tickers_to_fetch: return ""
         
         logging.info("⏳ 执行 T+N 复盘...")
-        current_data = yf.download(list(tickers_to_fetch), period="1d", group_by="ticker", show_errors=False, threads=True)
+        # 移除已弃用的 show_errors 参数
+        current_data = yf.download(list(tickers_to_fetch), period="1d", group_by="ticker", threads=True)
         current_prices = {}
         for t in tickers_to_fetch:
             try:
