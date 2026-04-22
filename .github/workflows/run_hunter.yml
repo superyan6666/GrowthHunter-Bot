@@ -55,7 +55,7 @@ jobs:
       uses: dawidd6/action-download-artifact@v3
       continue-on-error: true
       with:
-        github_token: ${{secrets.GITHUB_TOKEN}}
+        github_token: ${{ secrets.GITHUB_TOKEN }}
         workflow: run_hunter.yml
         workflow_conclusion: success
         name_is_regexp: true
@@ -82,7 +82,7 @@ jobs:
         fi
 
     - name: 上传归档数据与报告为构建产物
-      if: ${{ inputs.test_mode != 'true' && inputs.dry_run != 'true' }}
+      if: inputs.test_mode != true && inputs.dry_run != true
       uses: actions/upload-artifact@v4
       with:
         name: growth-hunter-artifacts-${{ github.run_number }}
@@ -92,4 +92,3 @@ jobs:
           growth_hunter_results.md
           small_cap_cache.csv
         retention-days: 90
-```
