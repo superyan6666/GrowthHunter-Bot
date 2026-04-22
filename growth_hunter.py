@@ -1,6 +1,7 @@
 """
 🚀 GrowthHunter V10.0 - 终极量化引擎 (Alternative Data Edition)
 新增能力：Reddit 另类数据捕捉 (r/wallstreetbets) + 散户狂热指数
+进阶能力：全生命周期资金闭环 (动态止盈止损 + 资金复利滚动)
 """
 
 import yfinance as yf
@@ -120,7 +121,7 @@ def check_macro_regime():
         return 'GREEN', "大盘校验异常，默认放行"
 
 # ==========================================
-# 模块 C：SQLite 数据库
+# 模块 C：SQLite 数据库与持仓管理
 # ==========================================
 def init_db():
     conn = sqlite3.connect('growth_hunter_signals.db')
@@ -145,12 +146,23 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_date ON signals (date)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_symbol ON signals (symbol)')
     
+    # 真实持仓表
     c.execute('''
         CREATE TABLE IF NOT EXISTS portfolio_holdings (
             symbol TEXT PRIMARY KEY, shares INTEGER,
             cost_basis REAL, purchase_date TEXT
         )
     ''')
+    
+    # 【Phase 2 新增】：组合资金汇总表，记录已实现盈亏 (Realized PnL)，实现真正的资金滚动
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS portfolio_summary (
+            id INTEGER PRIMARY KEY,
+            realized_pnl REAL
+        )
+    ''')
+    c.execute('INSERT OR IGNORE INTO portfolio_summary (id, realized_pnl) VALUES (1, 0.0)')
+    
     conn.commit()
     conn.close()
 
@@ -191,11 +203,15 @@ def save_signals_to_db(df, tickers_scanned_count, passed_tech_count):
 def get_remaining_cash():
     try:
         conn = sqlite3.connect('growth_hunter_signals.db')
-        df = pd.read_sql_query("SELECT shares, cost_basis FROM portfolio_holdings", conn)
+        df_holdings = pd.read_sql_query("SELECT shares, cost_basis FROM portfolio_holdings", conn)
+        df_pnl = pd.read_sql_query("SELECT realized_pnl FROM portfolio_summary WHERE id=1", conn)
         conn.close()
-        if df.empty: return Config.PORTFOLIO_VALUE
-        invested = (df['shares'] * df['cost_basis']).sum()
-        return max(0, Config.PORTFOLIO_VALUE - invested)
+        
+        realized_pnl = df_pnl.iloc[0]['realized_pnl'] if not df_pnl.empty else 0.0
+        invested = (df_holdings['shares'] * df_holdings['cost_basis']).sum() if not df_holdings.empty else 0.0
+        
+        # 剩余可用资金 = 初始总净值 + 已实现盈亏 - 当前持仓占用资金
+        return max(0, Config.PORTFOLIO_VALUE + realized_pnl - invested)
     except Exception:
         return Config.PORTFOLIO_VALUE
 
@@ -221,6 +237,87 @@ def update_portfolio(selected_rows):
         if updated_count > 0: logging.info(f"💼 组合持仓同步：{updated_count} 只标的入账。")
     except Exception as e:
         logging.error(f"⚠️ 持仓状态更新失败: {e}")
+
+def review_portfolio():
+    """
+    【Phase 2 新增】全生命周期闭环：盘前持仓巡检，自动卖出止盈止损释放资金
+    """
+    logging.info("🧐 开始执行盘前持仓体检与自动退出逻辑 (Exit Logic)...")
+    try:
+        conn = sqlite3.connect('growth_hunter_signals.db')
+        holdings = pd.read_sql_query("SELECT * FROM portfolio_holdings", conn)
+        if holdings.empty:
+            conn.close()
+            logging.info("📉 当前无持仓，跳过退出审查。")
+            return ""
+
+        sell_report = []
+        tickers = holdings['symbol'].tolist()
+        
+        # 获取现有持仓的最新技术走势
+        data = yf.download(tickers, period="1y", group_by="ticker", progress=False)
+        pnl_update = 0.0
+        symbols_to_remove = []
+
+        for _, row in holdings.iterrows():
+            sym = row['symbol']
+            try:
+                if len(tickers) == 1:
+                    df = data.copy()
+                else:
+                    if sym not in data.columns.levels[0] and sym not in data.columns.levels[1]:
+                        continue
+                    df = data[sym].copy()
+
+                df = df.dropna(subset=['Close'])
+                if len(df) < 50: continue
+
+                # 计算移动止盈保护线 (SuperTrend)
+                df.ta.supertrend(length=7, multiplier=3.0, append=True)
+                st_dir_col = next((col for col in df.columns if col.startswith('SUPERTd_')), None)
+
+                current_close = float(df['Close'].iloc[-1])
+                cost_basis = float(row['cost_basis'])
+                shares = int(row['shares'])
+
+                # 退出条件 1：趋势追踪破位 (SuperTrend由绿转红)
+                is_downtrend = (df[st_dir_col].iloc[-1] == -1) if st_dir_col else False
+                
+                # 退出条件 2：硬性止损保护 (跌破成本价 15%)
+                is_hard_stop = current_close < cost_basis * 0.85
+                
+                # 退出条件 3：翻倍落袋为安 (涨幅 >= 100%)
+                is_take_profit = current_close >= cost_basis * 2.0
+
+                if is_downtrend or is_hard_stop or is_take_profit:
+                    realized = (current_close - cost_basis) * shares
+                    pnl_update += realized
+                    symbols_to_remove.append(sym)
+
+                    reason = "📈 翻倍止盈" if is_take_profit else ("📉 趋势破位" if is_downtrend else "🛑 触及硬止损")
+                    ret_pct = (current_close - cost_basis) / cost_basis
+                    sell_report.append(f"  └ 卖出 [{sym}] ({reason}): 成本 ${cost_basis:.2f} -> 卖出价 ${current_close:.2f} (盈亏: {ret_pct:+.1%}, 释放回笼: ${current_close * shares:.2f})")
+
+            except Exception as e:
+                logging.debug(f"持仓审查异常 {sym}: {e}")
+
+        if symbols_to_remove:
+            c = conn.cursor()
+            # 将本次卖出产生的盈亏加入全局 PnL
+            c.execute('UPDATE portfolio_summary SET realized_pnl = realized_pnl + ? WHERE id = 1', (pnl_update,))
+            # 将该股票从持仓中清零
+            c.executemany('DELETE FROM portfolio_holdings WHERE symbol = ?', [(sym,) for sym in symbols_to_remove])
+            conn.commit()
+
+        conn.close()
+
+        if sell_report:
+            logging.info(f"♻️ 完成清仓退出，释放资金，总盈亏更新: ${pnl_update:+.2f}")
+            return "♻️ **【组合自动调仓 (卖出与退出)】**\n" + "\n".join(sell_report) + "\n\n"
+        return ""
+    except Exception as e:
+        logging.error(f"持仓审查发生致命错误: {e}")
+        return ""
 
 # ==========================================
 # 模块 B：异动面引擎 (内幕、期权、新闻、Reddit)
@@ -759,10 +856,14 @@ def run_auto_backtest():
         return report
     except Exception as e: return f"\n⚠️ 复盘异常: {e}\n"
 
-def send_notifications(df, backtest_report=""):
-    if df.empty and not backtest_report: return logging.info("📭 今日无新增起爆股且无复盘。")
+def send_notifications(df, sell_report="", backtest_report=""):
+    if df.empty and not backtest_report and not sell_report: return logging.info("📭 今日无任何异动或复盘。")
         
-    summary = f"🚀 GrowthHunter V10.0 异动播报\n\n" + (f"捕获 {len(df)} 只底盘扎实且量价齐升的起爆股！\n\n" if not df.empty else "今日无新增达标标的。\n\n")
+    summary = f"🚀 GrowthHunter V10.0 (持仓调配全闭环)\n\n" 
+    if sell_report:
+        summary += sell_report
+        
+    summary += (f"【新增捕获】 {len(df)} 只底盘扎实且量价齐升的起爆股：\n\n" if not df.empty else "今日无新增达标买入标的。\n\n")
     for _, row in df.head(10).iterrows():
         item = f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
         if len(summary) + len(item) > 3500: summary += "...（已自动截断）\n\n"; break
@@ -794,17 +895,20 @@ def send_notifications(df, backtest_report=""):
     logging.info("="*30 + "\n")
 
 def main(dry_run=False, input_file=None):
-    logging.info("="*40 + " 🚀 GrowthHunter V10.0 (Alternative Data Edition) " + "="*40)
+    logging.info("="*40 + " 🚀 GrowthHunter V10.0 (全生命周期调仓版) " + "="*40)
     if dry_run: logging.info("🏃 【DRY-RUN 空跑模式启动】")
     
     init_db()
+    
+    # 每天扫描新股前，先对现有持仓进行审查（自动卖出、释放资金）
+    sell_report = "" if dry_run else review_portfolio()
     
     regime, macro_reason = check_macro_regime()
     if regime == 'RED':
         logging.warning("🛑 宏观红灯，触发系统熔断！")
         if not dry_run:
             bt_report = run_auto_backtest()
-            send_notifications(pd.DataFrame(), f"🚨 **大盘红灯熔断警告**\n{macro_reason}\n\n🛑 **防守指令**：今日暂停买入操作，注意破位止损！\n\n{bt_report}")
+            send_notifications(pd.DataFrame(), sell_report, f"🚨 **大盘红灯熔断警告**\n{macro_reason}\n\n🛑 **防守指令**：今日暂停买入操作，注意破位止损！\n\n{bt_report}")
         return
     elif regime == 'YELLOW':
         logging.warning(f"⚠️ 宏观黄灯警告：{macro_reason}")
@@ -815,11 +919,11 @@ def main(dry_run=False, input_file=None):
     passed_tech_tickers, tech_data_dict = batch_technical_screen(tickers)
     
     if not passed_tech_tickers:
-        logging.info("📉 今日无标的通过技术面初筛，进入复盘结算环节。")
+        logging.info("📉 今日无新标的通过技术面初筛。")
         df = pd.DataFrame()
     else:
         results = []
-        logging.info(f"⏳ 第二阶段：深挖 {len(passed_tech_tickers)} 只标的财务、期权、散户情绪与风投叙事...")
+        logging.info(f"⏳ 第二阶段：深挖 {len(passed_tech_tickers)} 只新标的财务、期权、散户情绪与风投叙事...")
         with ThreadPoolExecutor(max_workers=Config.THREAD_WORKERS) as executor:
             futures = {executor.submit(analyze_fundamentals, sym, tech_data_dict.get(sym, {'close': 0.0, 'atr': 0.0, 'tech_score': 0}), regime): sym for sym in passed_tech_tickers}
             for f in as_completed(futures):
@@ -831,7 +935,7 @@ def main(dry_run=False, input_file=None):
         df = df.sort_values(by=['综合得分', '市值(亿美元)'], ascending=[False, True])
         
         remaining_cash = get_remaining_cash()
-        logging.info(f"💵 当前组合剩余可用资金: ${remaining_cash:.2f} / ${Config.PORTFOLIO_VALUE:.2f}")
+        logging.info(f"💵 当前组合剩余可用资金: ${remaining_cash:.2f} / 初始净值 ${Config.PORTFOLIO_VALUE:.2f}")
         
         final_selected = []
         
@@ -879,13 +983,14 @@ def main(dry_run=False, input_file=None):
         save_signals_to_db(df, len(tickers), len(passed_tech_tickers))
         update_portfolio(final_selected)
         backtest_report = run_auto_backtest()
-        send_notifications(df, backtest_report)
+        # 将每日的卖出报告、新增买入、历史复盘合并推送给用户
+        send_notifications(df, sell_report, backtest_report)
 
 def test_notifications():
     logging.info("🔧 推送测试...")
     init_db()
     save_signals_to_db(pd.DataFrame([{'股票代码': 'TEST', '公司名称': '配置测试股', '市值(亿美元)': 8.8, '营收增速': '50%', 'F-Score': '9/9', '综合得分': 7, '期权异动': '🔥 爆单', '催化剂': '🚀 情绪95 [财报超预期] 利润翻倍指引上调', '散户情绪': '🦍 极度狂热', '内幕交易': '🚨 买入', '轧空雷达': '🩸 轧空', '最新收盘价': 100.5, '筛选理由': 'V10.0 Reddit 引擎就绪！'}]), 1, 1)
-    send_notifications(pd.DataFrame(), "\n📊 【战报】\n • T+1 (推 3只): 胜率 67% | 均收益 +4.2%\n")
+    send_notifications(pd.DataFrame(), "♻️ **【组合自动调仓】**\n  └ 卖出 [TEST] (📈 翻倍止盈): 成本 $50 -> 卖出价 $100\n\n", "\n📊 【战报】\n • T+1 (推 3只): 胜率 67% | 均收益 +4.2%\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
