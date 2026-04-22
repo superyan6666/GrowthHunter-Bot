@@ -20,6 +20,7 @@ import logging
 import atexit
 import argparse
 import json
+from io import StringIO
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -487,19 +488,26 @@ def get_small_cap_tickers(input_file=None):
 
     tickers = []
     
-    # 【股票池优化】：新增抓取维基百科 S&P 600 和 S&P 400，从不封IP，保底1000+标的
+    # 【股票池优化】：使用 requests 携带随机 User-Agent 伪装，防止 Actions 服务器被维基百科 403 拦截
     try:
-        sp600 = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_600_companies')[0]['Symbol'].tolist()
-        sp400 = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_400_companies')[0]['Symbol'].tolist()
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        r_sp600 = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_600_companies', headers=headers, timeout=15)
+        sp600 = pd.read_html(StringIO(r_sp600.text))[0]['Symbol'].tolist()
+        
+        r_sp400 = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_400_companies', headers=headers, timeout=15)
+        sp400 = pd.read_html(StringIO(r_sp400.text))[0]['Symbol'].tolist()
+        
         tickers.extend(sp600 + sp400)
-    except Exception: pass
+    except Exception as e: 
+        logging.debug(f"维基百科抓取失败: {e}")
+        pass
 
     # 尝试 Russell 2000
     for url in ['https://stockanalysis.com/list/russell-2000/', 'https://www.marketbeat.com/russell-2000/']:
         try:
             response = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
             response.raise_for_status()
-            rs_tickers = pd.read_html(response.text)[0]['Symbol'].tolist()
+            rs_tickers = pd.read_html(StringIO(response.text))[0]['Symbol'].tolist()
             tickers.extend(rs_tickers)
         except Exception: continue
         
