@@ -154,7 +154,7 @@ def init_db():
         )
     ''')
     
-    # 【Phase 2 新增】：组合资金汇总表，记录已实现盈亏 (Realized PnL)，实现真正的资金滚动
+    # 组合资金汇总表，记录已实现盈亏 (Realized PnL)，实现真正的资金滚动
     c.execute('''
         CREATE TABLE IF NOT EXISTS portfolio_summary (
             id INTEGER PRIMARY KEY,
@@ -239,9 +239,7 @@ def update_portfolio(selected_rows):
         logging.error(f"⚠️ 持仓状态更新失败: {e}")
 
 def review_portfolio():
-    """
-    【Phase 2 新增】全生命周期闭环：盘前持仓巡检，自动卖出止盈止损释放资金
-    """
+    """盘前持仓巡检，自动卖出止盈止损释放资金"""
     logging.info("🧐 开始执行盘前持仓体检与自动退出逻辑 (Exit Logic)...")
     try:
         conn = sqlite3.connect('growth_hunter_signals.db')
@@ -254,7 +252,6 @@ def review_portfolio():
         sell_report = []
         tickers = holdings['symbol'].tolist()
         
-        # 获取现有持仓的最新技术走势
         data = yf.download(tickers, period="1y", group_by="ticker", progress=False)
         pnl_update = 0.0
         symbols_to_remove = []
@@ -272,7 +269,6 @@ def review_portfolio():
                 df = df.dropna(subset=['Close'])
                 if len(df) < 50: continue
 
-                # 计算移动止盈保护线 (SuperTrend)
                 df.ta.supertrend(length=7, multiplier=3.0, append=True)
                 st_dir_col = next((col for col in df.columns if col.startswith('SUPERTd_')), None)
 
@@ -280,13 +276,8 @@ def review_portfolio():
                 cost_basis = float(row['cost_basis'])
                 shares = int(row['shares'])
 
-                # 退出条件 1：趋势追踪破位 (SuperTrend由绿转红)
                 is_downtrend = (df[st_dir_col].iloc[-1] == -1) if st_dir_col else False
-                
-                # 退出条件 2：硬性止损保护 (跌破成本价 15%)
                 is_hard_stop = current_close < cost_basis * 0.85
-                
-                # 退出条件 3：翻倍落袋为安 (涨幅 >= 100%)
                 is_take_profit = current_close >= cost_basis * 2.0
 
                 if is_downtrend or is_hard_stop or is_take_profit:
@@ -303,9 +294,7 @@ def review_portfolio():
 
         if symbols_to_remove:
             c = conn.cursor()
-            # 将本次卖出产生的盈亏加入全局 PnL
             c.execute('UPDATE portfolio_summary SET realized_pnl = realized_pnl + ? WHERE id = 1', (pnl_update,))
-            # 将该股票从持仓中清零
             c.executemany('DELETE FROM portfolio_holdings WHERE symbol = ?', [(sym,) for sym in symbols_to_remove])
             conn.commit()
 
@@ -323,7 +312,6 @@ def review_portfolio():
 # 模块 B：异动面引擎 (内幕、期权、新闻、Reddit)
 # ==========================================
 def analyze_social_sentiment(symbol):
-    """【V10.0 新增】利用 Reddit API 扫描 WallStreetBets 等板块的散户狂热度"""
     def _fetch_reddit():
         if not HAS_PRAW: return 0, "未装配 PRAW 库"
         client_id = os.getenv("REDDIT_CLIENT_ID")
@@ -336,13 +324,10 @@ def analyze_social_sentiment(symbol):
                 client_secret=client_secret,
                 user_agent="GrowthHunter_V10/1.0"
             )
-            # 扫描核心散户赌场与股票版块
             subs = reddit.subreddit("wallstreetbets+stocks+pennystocks")
             mentions = 0
-            # 搜索最近一周的讨论，限制 30 条以保障速度
             for submission in subs.search(f"{symbol}", sort="new", time_filter="week", limit=30):
                 text = f"{submission.title} {submission.selftext}".upper()
-                # 严格使用正则匹配独立的 Ticker，防止匹配到日常单词中的子串
                 if re.search(rf'\b{symbol}\b', text):
                     mentions += 1
                     
@@ -918,6 +903,9 @@ def main(dry_run=False, input_file=None):
 
     passed_tech_tickers, tech_data_dict = batch_technical_screen(tickers)
     
+    # 【Bug 修复】：提前初始化 final_selected 以防 df.empty 导致未被定义
+    final_selected = []
+
     if not passed_tech_tickers:
         logging.info("📉 今日无新标的通过技术面初筛。")
         df = pd.DataFrame()
@@ -936,8 +924,6 @@ def main(dry_run=False, input_file=None):
         
         remaining_cash = get_remaining_cash()
         logging.info(f"💵 当前组合剩余可用资金: ${remaining_cash:.2f} / 初始净值 ${Config.PORTFOLIO_VALUE:.2f}")
-        
-        final_selected = []
         
         for _, row in df.iterrows():
             shares = row['建议股数']
