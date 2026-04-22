@@ -52,12 +52,12 @@ jobs:
 
     - name: 环境检查与依赖安装
       # [细节优化] 打印 python 和 pip 版本，方便未来排错
-      # [V9.0 升级] 替换为最新的 google-genai 库，修复旧版废弃导致的报错
+      # [V10.0 升级] 追加了 praw 库，激活 Reddit 散户情绪与另类数据引擎
       run: |
         python --version
         pip --version
         python -m pip install --upgrade pip
-        pip install yfinance pandas pandas-ta requests lxml html5lib tabulate google-genai
+        pip install yfinance pandas pandas-ta requests lxml html5lib tabulate google-genai praw
 
     # 【终极补丁：记忆继承】从上一次成功的运行中下载历史数据库和缓存，实现真正的跨日增量存储
     - name: ⬇️ 下载历史数据库与股票池缓存
@@ -72,7 +72,7 @@ jobs:
         path: .
 
     - name: 运行量化程序
-      # [V9.0 升级] 挂载 GEMINI_API_KEY，激活 AI 语义大脑
+      # [V9.0/V10.0 升级] 挂载 GEMINI_API_KEY 与 REDDIT 凭证，激活双轨 AI 脑
       env:
         SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -80,6 +80,8 @@ jobs:
         FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
         DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }} 
+        REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
       run: |
         if [ "${{ inputs.test_mode }}" == "true" ]; then
           echo "检测到测试模式，执行推送测试..."
@@ -94,11 +96,9 @@ jobs:
 
     # 【终极补丁：修复 Git 仓库膨胀与冲突】将二进制数据库和报告改为 GitHub Artifacts 归档
     - name: 上传归档数据与报告为构建产物
-      # [细节优化] 仅在非测试/非空跑模式下上传，避免产生毫无意义的空文件占用空间
       if: ${{ inputs.test_mode != 'true' && inputs.dry_run != 'true' }}
       uses: actions/upload-artifact@v4
       with:
-        # [细节优化] 添加 run_number，使每次构建生成的 Artifact 拥有独一无二的名字，美观且易于追溯
         name: growth-hunter-artifacts-${{ github.run_number }}
         path: |
           growth_hunter_signals.db
