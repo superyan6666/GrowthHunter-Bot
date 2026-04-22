@@ -1103,11 +1103,12 @@ def run_auto_backtest():
 def send_notifications(df, sell_report="", backtest_report=""):
     if df.empty and not backtest_report and not sell_report: return logging.info("📭 今日无任何异动或复盘。")
         
-    summary = f"🚀 GrowthHunter V10.0 (持仓调配全闭环)\n\n" 
+    # 【修复】：将 AI 关键词注入大标题，满足钉钉机器人的自定义关键词安全校验
+    summary = f"🚀 [AI] GrowthHunter V10.0 (持仓调配全闭环)\n\n" 
     if sell_report:
         summary += sell_report
         
-    summary += (f"【新增捕获】 {len(df)} 只底盘扎实且主升浪确认的起爆股：\n\n" if not df.empty else "今日无新增达标买入标的。\n\n")
+    summary += (f"【新增捕获】 {len(df)} 只带有精确点火信号的起爆股：\n\n" if not df.empty else "今日无新增达标买入标的。\n\n")
     for _, row in df.head(10).iterrows():
         item = f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
         if len(summary) + len(item) > 3500: summary += "...（已自动截断）\n\n"; break
@@ -1119,7 +1120,7 @@ def send_notifications(df, sell_report="", backtest_report=""):
         val = os.getenv(env_key)
         if not val: status_report.append(f"⚪ {platform}: 未配置"); continue
         try:
-            if platform == '微信': res = requests.get(f"https://sctapi.ftqq.com/{val}.send", params={"title": "🚀 V10.0 起爆预警", "desp": summary}, timeout=10)
+            if platform == '微信': res = requests.get(f"https://sctapi.ftqq.com/{val}.send", params={"title": "🚀 [AI] V10.0 起爆预警", "desp": summary}, timeout=10)
             elif platform == 'Telegram':
                 chat_id = os.getenv('TELEGRAM_CHAT_ID')
                 if not chat_id: status_report.append(f"⚪ Telegram: 缺 CHAT_ID"); continue
@@ -1238,7 +1239,7 @@ def test_notifications():
     logging.info("🔧 推送测试...")
     init_db()
     save_signals_to_db(pd.DataFrame([{'股票代码': 'TEST', '公司名称': '配置测试股', '市值(亿美元)': 8.8, '营收增速': '50%', 'F-Score': '9/9', '综合得分': 7, '期权异动': '🔥 爆单', '催化剂': '🚀 情绪95 [财报超预期] 利润翻倍指引上调', '散户情绪': '🦍 极度狂热', '内幕交易': '🚨 买入', '轧空雷达': '🩸 轧空', '最新收盘价': 100.5, '买入触发': '🎯枢轴突破 | 🚀强势缺口', '核心质地': '🔥营收加速', '交易动作': '🆕建仓(首发50%)', '行业': 'Technology', '筛选理由': 'V10.0 Reddit 引擎就绪！', 'data_tag': ''}]), 1, 1)
-    send_notifications(pd.DataFrame(), "♻️ **【组合动态调仓与止盈防线】**\n  └ 卖出 [TEST] (🏆 追踪止盈 (高点回撤20%, 巅峰$120.00)): 成本 $50 -> 卖价 $96 (盈亏: +92.0%, 回笼: $14400.00)\n\n", "\n📊 【战报】\n • T+1 (推 3只): 胜率 67% | 均收益 +4.2%\n")
+    send_notifications(pd.DataFrame(), "♻️ **【组合动态调仓与止盈防线】**\n  └ 卖出 [TEST] (🏆 追踪止盈 (高点回撤20%, 巅峰$120.00)): 成本 $50 -> 卖价 $96 (盈亏: +92.0%, 回笼: $14400.00)\n\n", "\n📊 【AI战报】\n • T+1 (推 3只): 胜率 67% | 均收益 +4.2%\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
