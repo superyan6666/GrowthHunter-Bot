@@ -1,7 +1,8 @@
 """
 GrowthHunter V10.0 - 终极量化引擎 (Alternative Data Edition)
 能力模块：Reddit 数据捕捉 + 散户狂热指数 + 宏观风控 + 动态止盈止损
-强化升级：同比营收加速、金字塔建仓防线、估值/财报催化因子、因子归因回测
+强化升级：同比营收加速、金字塔建仓防线、估值/财报催化因子、因子归因回测、并发锁修复
+极致校准：回归10倍股基因 (取消高估值惩罚 + 新增 R&D 研发支出潜伏因子)
 """
 
 import yfinance as yf
@@ -92,7 +93,8 @@ def check_macro_regime():
     logging.info("🌍 启动风控系统：扫描多维宏观与流动性矩阵 (Macro Regime)...")
     try:
         macro_tickers = ["SPY", "IWM", "^VIX", "HYG", "LQD", "UUP", "XLK", "XLE"]
-        macro_data = yf.download(macro_tickers, period="1y", group_by="ticker", progress=False)
+        # [核心修复] 加入 threads=False，防止 yfinance 首次初始化内部 SQLite 时区缓存时触发数据库写锁冲突
+        macro_data = yf.download(macro_tickers, period="1y", group_by="ticker", progress=False, threads=False)
         
         if macro_data.empty: 
             return 'GREEN', "无法获取大盘数据，默认放行"
@@ -262,7 +264,8 @@ def get_portfolio_state():
         if not df_holdings.empty:
             tickers = df_holdings['symbol'].tolist()
             try:
-                current_data = yf.download(tickers, period="1d", group_by="ticker", progress=False)
+                # 同样加入 threads=False 防御并发锁
+                current_data = yf.download(tickers, period="1d", group_by="ticker", progress=False, threads=False)
             except Exception:
                 current_data = pd.DataFrame()
 
@@ -332,7 +335,8 @@ def review_portfolio():
         tickers = holdings['symbol'].tolist()
         dl_list = tickers + [Config.BENCHMARK_TICKER]
         
-        data = yf.download(dl_list, period="1y", group_by="ticker", progress=False)
+        # 少量标的同样禁用多线程，防止与SQLite冲突
+        data = yf.download(dl_list, period="1y", group_by="ticker", progress=False, threads=False)
         
         iwm_close = None
         if isinstance(data.columns, pd.MultiIndex) and Config.BENCHMARK_TICKER in data.columns.levels[0]:
@@ -408,7 +412,8 @@ def run_auto_backtest():
         
         report = "\n📊 【系统真实回测战报 (修正版追踪止损)】\n"
         tickers_to_fetch = set(df_db['symbol'].tolist())
-        current_data = yf.download(list(tickers_to_fetch), period="2mo", group_by="ticker", progress=False)
+        # 同理，回测数据量通常较少，加 threads=False 防御
+        current_data = yf.download(list(tickers_to_fetch), period="2mo", group_by="ticker", progress=False, threads=False)
         
         # 1. 总体统计
         for label, n in {'T+5': 5, 'T+15': 15, 'T+25': 25}.items():
@@ -577,10 +582,11 @@ def calculate_piotroski_f_score(balance, cashflow, income):
 def get_small_cap_tickers(input_file=None):
     if input_file and os.path.exists(input_file):
         return pd.read_csv(input_file).iloc[:, 0].tolist()
-    return ['LUNR', 'BBAI', 'SOUN', 'GCT', 'VLD', 'STEM', 'IONQ', 'JOBY', 'ACHR', 'HUT', 'CLSK', 'BITF', 'IREN', 'WOLF', 'PLTR', 'HOOD', 'RDDT', 'RIVN', 'ASTS', 'LCID', 'MSTR']
+    return ['LUNR', 'BBAI', 'SOUN', 'GCT', 'STEM', 'IONQ', 'JOBY', 'ACHR', 'HUT', 'CLSK', 'BITF', 'IREN', 'WOLF', 'PLTR', 'HOOD', 'RDDT', 'RIVN', 'ASTS', 'LCID', 'MSTR']
 
 def batch_technical_screen(tickers):
     logging.info(f"⏳ 批量下载 {len(tickers)} 只股票及大盘基准...")
+    # 主流程依然保持 threads=True 提升效率，因为之前的顺序下载已经成功建立了缓存
     data = yf.download(tickers + [Config.BENCHMARK_TICKER], period="1y", group_by="ticker", threads=True)
     if data.empty: return [], {}
     
@@ -628,12 +634,19 @@ def analyze_fundamentals(symbol, tech_info, regime, portfolio_state):
         if op_margin is not None:
             is_r40 = (rev_growth + op_margin) * 100 >= 40.0
             
-        # EV/Sales 估值因子：防止极高估值的票进入
+        # EV/Sales 估值因子：仅奖励低估，不惩罚高估 (10倍股初期常伴随极高估值)
         ev_to_sales = info.get('enterpriseToRevenue')
         val_score = 0
-        if ev_to_sales:
-            if ev_to_sales < 5.0: val_score += 1
-            elif ev_to_sales > 20.0: val_score -= 1
+        if ev_to_sales and ev_to_sales < 5.0:
+            val_score += 1
+            
+        # R&D 研发投入加分：识别财报难看但潜力巨大的科技股
+        rnd_score = 0
+        inc_stmt = ticker.income_stmt
+        if inc_stmt is not None and not inc_stmt.empty and 'Research And Development' in inc_stmt.index:
+            rnd_data = inc_stmt.loc['Research And Development'].dropna()
+            if not rnd_data.empty and rnd_data.iloc[0] > 0:
+                rnd_score += 1
             
         # 同比 (YoY) 营收加速计算逻辑
         q_inc = ticker.quarterly_income_stmt
@@ -654,10 +667,6 @@ def analyze_fundamentals(symbol, tech_info, regime, portfolio_state):
             
         f_score = calculate_piotroski_f_score(ticker.balance_sheet, ticker.cashflow, ticker.income_stmt)
         
-        is_hyper = rev_growth >= Config.HYPER_GROWTH_THRESHOLD
-        if not (is_hyper or is_r40 or tech_info['tech_score'] >= 3):
-            if rev_growth < Config.REVENUE_GROWTH_MIN or f_score < Config.F_SCORE_MIN: return None
-        
         # 异动面聚合
         options = analyze_options_flow(symbol)
         catalyst = analyze_catalyst(symbol)
@@ -665,7 +674,13 @@ def analyze_fundamentals(symbol, tech_info, regime, portfolio_state):
         reddit_score, reddit_signal = analyze_social_sentiment(symbol)
         earn_score, earn_signal = analyze_earnings_calendar(symbol) # 财报催化剂
         
-        comp_score = tech_info['tech_score'] + reddit_score + earn_score + val_score + (1 if '🔥' in options else 0) + (1 if rev_accel else 0)
+        # 终极豁免权：符合超常成长/R40，且处于技术爆发期或存在散户狂热，彻底无视 F-Score 拦截
+        is_hyper = rev_growth >= Config.HYPER_GROWTH_THRESHOLD
+        if not ((is_hyper or is_r40) and (tech_info['tech_score'] >= 3 or reddit_score >= 1)):
+            # 只有普通标的才接受严格财务审查
+            if rev_growth < Config.REVENUE_GROWTH_MIN or f_score < Config.F_SCORE_MIN: return None
+        
+        comp_score = tech_info['tech_score'] + reddit_score + earn_score + val_score + rnd_score + (1 if '🔥' in options else 0) + (1 if rev_accel else 0)
         
         # 金字塔资金调度与止损基线
         shares, action_tag = 0, "🔭 观察等待点火"
@@ -693,7 +708,7 @@ def analyze_fundamentals(symbol, tech_info, regime, portfolio_state):
             '股票代码': symbol, '公司名称': info.get('longName', symbol), '行业': sector,
             '市值(亿)': round(mcap/1e8, 2), '综合得分': comp_score, '最新收盘价': round(close_price, 2),
             '建议股数': shares, '交易动作': action_tag, '买入触发': tech_info['triggers'], '散户情绪': reddit_signal,
-            '筛选理由': f"{options} | {earn_signal} | EV/S:{ev_to_sales if ev_to_sales else 'N/A'}"
+            '筛选理由': f"{options} | {earn_signal} | EV/S:{ev_to_sales if ev_to_sales else 'N/A'} | 研发:{'有' if rnd_score else '无'}"
         }
     except Exception: return None
 
