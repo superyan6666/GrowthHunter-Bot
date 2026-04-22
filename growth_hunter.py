@@ -2,13 +2,11 @@
 🚀 GrowthHunter V10.0 - 终极量化引擎 (Alternative Data Edition)
 新增能力：Reddit 另类数据捕捉 (r/wallstreetbets) + 散户狂热指数
 进阶能力：全生命周期资金闭环 (动态止盈止损 + 资金复利滚动)
-行情适配：维基百科稳定股票池 + 极强动能免检特权，破除好行情踏空盲区
+行情适配：维基百科稳定股票池 + 极强动能免检特权
 深度打磨：引入 Rule of 40、合并情绪因子降噪、动态ATR、消除回测前视偏差
 极致强化：严苛版营收加速度 (QoQ) + 毛利连续扩张 + 机构流向 + IBD式3重RS
-宏观雷达：流动性利差(HYG/LQD) + 强美元压制(UUP) + 风格轮动(XLK/XLE)
 精准点火：强制要求 🎯枢轴突破 / 🌊缩量反弹 / 🚀强势缺口 入场触发器
-头寸管理：【金字塔动态加仓(50-30-20) + 单一行业 30% 集中度防线】
-终极退出：【追踪止损(让利润奔跑) + 时间止损(清退死钱) + RS恶化提前逃顶】
+阶梯捕获：【新增观察池逻辑】，防止因条件过严导致信号窒息，兼顾深度与广度
 """
 
 import yfinance as yf
@@ -310,7 +308,6 @@ def update_portfolio(selected_rows):
         logging.error(f"⚠️ 持仓状态更新失败: {e}")
 
 def review_portfolio():
-    """【退出优化】：动态追踪止损、时间止损与RS恶化审查"""
     logging.info("🧐 开始执行盘前持仓体检与动态退出逻辑 (Dynamic Exit Logic)...")
     try:
         conn = sqlite3.connect('growth_hunter_signals.db')
@@ -324,7 +321,6 @@ def review_portfolio():
         tickers = holdings['symbol'].tolist()
         dl_list = tickers + [Config.BENCHMARK_TICKER]
         
-        # 批量获取持仓与大盘数据
         data = yf.download(dl_list, period="1y", group_by="ticker", progress=False)
         
         iwm_close = None
@@ -358,7 +354,6 @@ def review_portfolio():
                 cost_basis = float(row['cost_basis'])
                 shares = int(row['shares'])
                 
-                # 提取买入时间后的表现用于计算追踪止损与时间止损
                 purchase_date_str = row.get('purchase_date', '')
                 try:
                     p_date = pd.to_datetime(purchase_date_str).tz_localize(None)
@@ -371,20 +366,14 @@ def review_portfolio():
 
                 is_downtrend = (df[st_dir_col].iloc[-1] == -1) if st_dir_col else False
                 is_hard_stop = current_close < cost_basis * 0.85
-                
-                # 【退出改进 1】：追踪止损 (代替硬翻倍止盈，让利润奔跑，回撤20%锁定)
                 is_trailing_stop = current_close <= max_high * 0.80
-                
-                # 【退出改进 2】：时间止损 (持仓超60天但涨幅不足10%，清退死钱)
                 is_time_stop = trading_days_held >= 60 and current_close < cost_basis * 1.10
                 
-                # 【退出改进 3】：RS 恶化预警
                 is_rs_deteriorated = False
                 if iwm_close is not None:
                     aligned_iwm = iwm_close.reindex(df.index).interpolate(method='linear').ffill()
                     rs_line = df['Close'] / aligned_iwm
                     rs_sma50 = rs_line.rolling(window=50).mean()
-                    # 如果 RS 跌破自身 50日均线，且股票并没有很厚的利润垫 (<20%)，提前逃顶
                     if pd.notna(rs_sma50.iloc[-1]) and rs_line.iloc[-1] < rs_sma50.iloc[-1]:
                         if current_close < cost_basis * 1.20:
                             is_rs_deteriorated = True
@@ -463,11 +452,9 @@ def analyze_insider_trading(symbol, io_executor):
     try:
         df = io_executor.submit(_fetch_insider).result(timeout=5)
         if df is None or df.empty: return "无近期记录"
-        try:
-            cutoff = datetime.now() - pd.Timedelta(days=Config.INSIDER_DAYS)
-            if isinstance(df.index, pd.DatetimeIndex): df = df[df.index.tz_localize(None) >= cutoff]
-            elif 'Start Date' in df.columns: df = df[pd.to_datetime(df['Start Date']).dt.tz_localize(None) >= cutoff]
-        except Exception: pass
+        cutoff = datetime.now() - pd.Timedelta(days=Config.INSIDER_DAYS)
+        if isinstance(df.index, pd.DatetimeIndex): df = df[df.index.tz_localize(None) >= cutoff]
+        elif 'Start Date' in df.columns: df = df[pd.to_datetime(df['Start Date']).dt.tz_localize(None) >= cutoff]
         if df.empty: return "无近期记录"
         
         buy_kw = ['Buy', 'Purchase', 'P - Purchase']
@@ -508,7 +495,6 @@ def analyze_catalyst(symbol, io_executor):
     try:
         news = io_executor.submit(lambda: yf.Ticker(symbol, session=get_session()).news).result(timeout=5)
         if not news: return "无最新消息"
-        
         latest_title = news[0].get('title', '无标题')
         short_title = latest_title[:25] + "..." if len(latest_title) > 25 else latest_title
 
@@ -518,61 +504,22 @@ def analyze_catalyst(symbol, io_executor):
                 try:
                     client = genai.Client(api_key=api_key)
                     news_text = "\n".join([f"- {n.get('title', '')}: {n.get('summary', '')}" for n in news[:5]])
-                    prompt = f"""作为资深风险投资(VC)与量化风控官，阅读股票 {symbol} 的近期新闻：
-{news_text}
-
-任务：提取关键信息，必须且只能输出一个合法的 JSON 字符串，不要任何 Markdown 标记。格式如下：
-{{
-  "sentiment_score": 85,
-  "event_type": "财报超预期/并购重组/新产品发布/其他",
-  "red_flag": "发现的具体致命风险(如增发/诉讼/退市等)，若无请严格填 null",
-  "vc_10x_potential": true, 
-  "summary": "限15个汉字的核心逻辑总结"
-}}
-注："vc_10x_potential" 布尔值，判定其是否具备“颠覆性技术/FDA突破/指数级爆发/散户高度狂热”等十倍股早期叙事特征。
-"""
-                    response = client.models.generate_content(
-                        model='gemini-1.5-flash',
-                        contents=prompt
-                    )
+                    prompt = f"""作为资深风险投资(VC)与量化风控官，阅读股票 {symbol} 的近期新闻：{news_text}
+任务：必须只能输出一个合法的 JSON 字符串，不要 Markdown。格式：
+{{ "sentiment_score": 85, "event_type": "...", "red_flag": "...", "vc_10x_potential": true, "summary": "..." }}"""
+                    response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
                     res_text = response.text.strip()
-                    
                     bt = '`' * 3
-                    if res_text.startswith(bt):
-                        res_text = re.sub(rf'^{bt}(?:json)?\n?|{bt}$', '', res_text).strip()
-                    
+                    if res_text.startswith(bt): res_text = re.sub(rf'^{bt}(?:json)?\n?|{bt}$', '', res_text).strip()
                     data = json.loads(res_text)
-                    score = data.get("sentiment_score", 50)
-                    event = data.get("event_type", "其他")
-                    risk = data.get("red_flag")
-                    vc_10x = data.get("vc_10x_potential", False)
-                    summary = data.get("summary", "")
-                    
-                    if risk and str(risk).lower() != 'null' and str(risk).strip() and risk != '无':
-                        return f"⛔ 致命警报 (风险: {risk})"
-                        
+                    score, event, risk, vc_10x, summary = data.get("sentiment_score", 50), data.get("event_type", "其他"), data.get("red_flag"), data.get("vc_10x_potential", False), data.get("summary", "")
+                    if risk and str(risk).lower() != 'null' and str(risk).strip() and risk != '无': return f"⛔ 致命警报 (风险: {risk})"
                     emoji = "🦄" if vc_10x else ("🚀" if score >= 60 else "⚠️" if score <= 40 else "⚖️")
                     vc_tag = " [10X潜力叙事]" if vc_10x else ""
                     return f"{emoji} 情绪{score} [{event}]{vc_tag} {summary}"
-                except Exception as e: 
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
-                        continue
+                except Exception:
+                    if attempt < 2: time.sleep(2); continue
                     break
-        
-        pos_words = ['beat', 'surge', 'upgrade', 'fda', 'acquire', 'buy', 'profit', 'record', 'breakout', 'partner', 'approval']
-        neg_words = ['miss', 'downgrade', 'lawsuit', 'investigate', 'offering', 'dilution', 'decline', 'warning', 'reject', 'fail', 'penalty']
-        score = 0
-        
-        for n in news[:3]:
-            title = n.get('title', '').lower()
-            has_pos = any(w in title for w in pos_words)
-            has_negation = any(re.search(rf'\b{neg}\b', title) for neg in ['not', 'fail', 'miss'])
-            if has_pos and not has_negation: score += 1
-            if any(w in title for w in neg_words): score -= 1
-        
-        if score > 0: return f"🚀 利好 ({short_title})"
-        elif score < 0: return f"⚠️ 偏空 ({short_title})"
         return f"中性 ({short_title})"
     except Exception: return "获取失败"
 
@@ -583,46 +530,27 @@ def get_small_cap_tickers(input_file=None):
     if input_file and os.path.exists(input_file):
         try:
             df = pd.read_csv(input_file)
-            if 'Symbol' in df.columns:
-                tickers = df['Symbol'].dropna().astype(str).tolist()
-            else:
-                df = pd.read_csv(input_file, header=None)
-                tickers = df.iloc[:, 0].dropna().astype(str).tolist()
-            tickers = [t.strip().upper() for t in tickers if t.strip()]
-            logging.info(f"📂 读取自定义股票池: {input_file} ({len(tickers)} 只)")
-            return tickers
+            tickers = df['Symbol'].dropna().astype(str).tolist() if 'Symbol' in df.columns else pd.read_csv(input_file, header=None).iloc[:, 0].dropna().astype(str).tolist()
+            return [t.strip().upper() for t in tickers if t.strip()]
         except Exception: pass
-
     cache_path = 'small_cap_cache.csv'
     if os.path.exists(cache_path) and (datetime.now() - datetime.fromtimestamp(os.path.getmtime(cache_path))).days < Config.CACHE_DAYS:
         try: return pd.read_csv(cache_path)['Symbol'].tolist()
         except Exception: pass
-
     tickers = set()
-    
     def fetch_wiki(url):
         try:
             r = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
             return pd.read_html(StringIO(r.text))[0]['Symbol'].tolist()
         except Exception: return []
-
     with ThreadPoolExecutor(max_workers=3) as executor:
-        future_sp600 = executor.submit(fetch_wiki, 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies')
-        future_sp400 = executor.submit(fetch_wiki, 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies')
-        future_rs = executor.submit(fetch_wiki, 'https://stockanalysis.com/list/russell-2000/')
-        
-        for f in as_completed([future_sp600, future_sp400, future_rs]):
+        for f in as_completed([executor.submit(fetch_wiki, u) for u in ['https://en.wikipedia.org/wiki/List_of_S%26P_600_companies', 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies', 'https://stockanalysis.com/list/russell-2000/']]):
             tickers.update(f.result())
-            
     tickers = list(tickers)
-        
     if tickers:
         tickers = list(set([str(t).replace('.', '-') for t in tickers]))
         pd.DataFrame(tickers, columns=['Symbol']).to_csv(cache_path, index=False)
-        logging.info(f"✅ 成功从并发网络抓取股票池，共 {len(tickers)} 只")
         return tickers
-
-    logging.error("❌ 所有网络股票池获取失败，启动扩容版保底防线...")
     return ['LUNR', 'BBAI', 'SOUN', 'GCT', 'VLD', 'STEM', 'IONQ', 'JOBY', 'ACHR', 'HUT', 'CLSK', 'BITF', 'IREN', 'WOLF', 'PLTR', 'HOOD', 'RDDT', 'RIVN', 'ASTS', 'LCID', 'MSTR']
 
 def check_unfilled_gap(df, lookback=5):
@@ -631,615 +559,209 @@ def check_unfilled_gap(df, lookback=5):
     gap_indices = gap_up.iloc[-lookback:].index[gap_up.iloc[-lookback:]]
     for gd in gap_indices:
         gap_idx = df.index.get_loc(gd)
-        if gap_idx < 1: continue
-        pre_gap_high = df['High'].iloc[gap_idx - 1]
-        post_gap_lows = df['Low'].iloc[gap_idx + 1:]
-        if len(post_gap_lows) == 0:
-            if df['Low'].iloc[-1] > pre_gap_high: return True
-            continue
-        if (post_gap_lows > pre_gap_high).all(): return True
+        if (df['Low'].iloc[gap_idx + 1:] > df['High'].iloc[gap_idx - 1]).all(): return True
     return False
 
 def batch_technical_screen(tickers):
     logging.info(f"⏳ 批量下载 {len(tickers)} 只股票及大盘基准...")
     download_list = tickers + [Config.BENCHMARK_TICKER]
-    
     data = None
     for _ in range(3):
         data = yf.download(download_list, period="1y", group_by="ticker", threads=True)
         if data is not None and not data.empty: break
         time.sleep(3)
-    
     if data is None or data.empty: return [], {}
-    
-    iwm_close = None
-    if isinstance(data.columns, pd.MultiIndex) and Config.BENCHMARK_TICKER in data.columns.get_level_values(0):
-        iwm_close = data[Config.BENCHMARK_TICKER]['Close']
-    elif not isinstance(data.columns, pd.MultiIndex) and 'Close' in data.columns and Config.BENCHMARK_TICKER in download_list:
-        iwm_close = data['Close']
-        
-    if iwm_close is not None:
-        if getattr(iwm_close.index, 'tz', None) is not None: iwm_close.index = iwm_close.index.tz_localize(None)
-
+    iwm_close = data[Config.BENCHMARK_TICKER]['Close'].ffill() if Config.BENCHMARK_TICKER in data.columns.levels[0] else None
     passed_tickers, tech_data = [], {}
-    is_github_actions = os.getenv('GITHUB_ACTIONS') == 'true'
-    
-    for sym in tqdm(tickers, desc="🎯 技术筛选", disable=is_github_actions):
+    for sym in tqdm(tickers, desc="🎯 技术筛选", disable=(os.getenv('GITHUB_ACTIONS') == 'true')):
         try:
-            if isinstance(data.columns, pd.MultiIndex):
-                if sym not in data.columns.levels[0] and sym not in data.columns.levels[1]: continue
-                df = data[sym].copy()
-            else:
-                if len(download_list) > 1 and sym not in data.columns: continue
-                df = data.copy()
-                
-            df = df.dropna(subset=['Close', 'Volume'])
+            df = data[sym].copy().dropna(subset=['Close', 'Volume'])
             if len(df) < 150: continue
-            if getattr(df.index, 'tz', None) is not None: df.index = df.index.tz_localize(None)
-            
             df.ta.supertrend(length=7, multiplier=3.0, append=True)
-            df.ta.atr(length=20, append=True) 
+            df.ta.atr(length=20, append=True)
             df.ta.cmf(length=20, append=True)
-            
-            vol_95th = df['Volume'].rolling(window=60).quantile(0.95)
             vol_ma20 = df['Volume'].rolling(window=20).mean()
-            
-            atr_col = next((col for col in df.columns if col.startswith('ATRr_20')), None)
-            cmf_col = next((col for col in df.columns if col.startswith('CMF')), None)
-            st_dir_col = next((col for col in df.columns if col.startswith('SUPERTd_')), None)
-            if not all([atr_col, cmf_col, st_dir_col]): continue
-            
-            idx = -1
-            current_close, current_vol = df['Close'].iloc[idx], df['Volume'].iloc[idx]
-            
-            sma20 = df['Close'].rolling(window=20).mean()
-            std20 = df['Close'].rolling(window=20).std()
-            
-            bb_upper = sma20 + 2 * std20
-            bb_lower = sma20 - 2 * std20
-            kc_upper = sma20 + 1.5 * df[atr_col]
-            kc_lower = sma20 - 1.5 * df[atr_col]
-            
-            is_uptrend = (df[st_dir_col].iloc[idx] == 1)
-            if not is_uptrend: continue
+            atr_col, cmf_col, st_dir_col = next(c for c in df.columns if c.startswith('ATRr_20')), next(c for c in df.columns if c.startswith('CMF')), next(c for c in df.columns if c.startswith('SUPERTd_'))
+            idx, current_close, current_vol = -1, df['Close'].iloc[-1], df['Volume'].iloc[-1]
+            if df[st_dir_col].iloc[-1] != 1: continue
 
             active_triggers = []
+            if current_close > df['High'].shift(1).rolling(window=25).max().iloc[-1]: active_triggers.append("🎯枢轴突破")
+            if df['Volume'].iloc[-4:-1].mean() < vol_ma20.iloc[-1] * 0.8 and current_vol > vol_ma20.iloc[-1] * 1.5 and current_close > df['Close'].rolling(20).mean().iloc[-1]: active_triggers.append("🌊缩量反弹")
+            if check_unfilled_gap(df, 5): active_triggers.append("🚀强势缺口")
 
-            highest_5w = df['High'].shift(1).rolling(window=25).max()
-            is_pivot_breakout = current_close > highest_5w.iloc[idx]
-            if is_pivot_breakout: active_triggers.append("🎯枢轴突破")
+            # IBD式 3重相对强度
+            rs_line = df['Close'] / iwm_close.reindex(df.index).ffill()
+            rs_sma50, rs_sma65, rs_sma130 = rs_line.rolling(50).mean(), rs_line.rolling(65).mean(), rs_line.rolling(130).mean()
+            rs_pass = rs_line.iloc[-1] > rs_sma50.iloc[-1] and rs_line.iloc[-1] > rs_sma65.iloc[-1] and rs_line.iloc[-1] > rs_sma130.iloc[-1]
 
-            recent_vol_quiet = df['Volume'].iloc[idx-3:idx].mean() < vol_ma20.iloc[idx] * 0.8
-            today_vol_spike = current_vol > vol_ma20.iloc[idx] * 1.5
-            price_rebound = (current_close > df['Close'].iloc[idx-1]) and (current_close > sma20.iloc[idx])
-            is_vcp_rebound = recent_vol_quiet and today_vol_spike and price_rebound
-            if is_vcp_rebound: active_triggers.append("🌊缩量反弹")
-
-            recent_gap = check_unfilled_gap(df, lookback=5)
-            if recent_gap: active_triggers.append("🚀强势缺口")
-
-            if not active_triggers:
-                continue
+            tech_score = (1 if current_vol > vol_ma20.iloc[-1] * 1.5 else 0) + (1 if rs_pass else 0) + (1 if df[cmf_col].iloc[-1] > 0 else 0)
             
-            aligned_iwm = iwm_close.reindex(df.index).interpolate(method='linear').ffill() if iwm_close is not None else df['Close'] * 0
-            rs_line = df['Close'] / aligned_iwm
-            rs_sma50 = rs_line.rolling(window=50).mean()   
-            rs_sma65 = rs_line.rolling(window=65).mean()   
-            rs_sma130 = rs_line.rolling(window=130).mean() 
+            # 【阶梯捕获】：哪怕今天没点火，只要技术分满分且大趋势极强，也放入待点火名单
+            is_elite_trend = tech_score >= 3 and rs_pass
             
-            rs_condition = (rs_line.iloc[idx] > rs_sma50.iloc[idx] if not pd.isna(rs_sma50.iloc[idx]) else False) and \
-                           (rs_line.iloc[idx] > rs_sma65.iloc[idx] if not pd.isna(rs_sma65.iloc[idx]) else False) and \
-                           (rs_line.iloc[idx] > rs_sma130.iloc[idx] if not pd.isna(rs_sma130.iloc[idx]) else False)
-                
-            tech_score = 0
-            if current_vol > max(vol_ma20.iloc[idx] * 1.5, vol_95th.iloc[idx] * 0.8): tech_score += 1
-            if rs_condition: tech_score += 1
-            if df[cmf_col].iloc[idx] > 0: tech_score += 1
-            
-            passed_tickers.append(sym)
-            tech_data[sym] = {
-                'close': float(current_close), 
-                'atr': float(df[atr_col].iloc[idx]), 
-                'tech_score': tech_score,
-                'triggers': " | ".join(active_triggers)
-            }
+            if active_triggers or is_elite_trend:
+                passed_tickers.append(sym)
+                tech_data[sym] = {'close': float(current_close), 'atr': float(df[atr_col].iloc[-1]), 'tech_score': tech_score, 'triggers': " | ".join(active_triggers) if active_triggers else "⏳ 趋势待点火", 'is_warmup': not bool(active_triggers)}
         except Exception: continue
-            
-    logging.info(f"🎯 阶段一完成：带有明确点火信号(Trigger)的标的仅剩 {len(passed_tickers)} 只")
     return passed_tickers, tech_data
 
-def calculate_piotroski_f_score(bs, cf, inc):
-    f_score = 0
-    try:
-        if bs is None or cf is None or inc is None or bs.empty or cf.empty or inc.empty: return "N/A"
-        def get_val(df, keys, idx=0):
-            try:
-                str_idx = df.index.astype(str).str.lower()
-                for key in keys:
-                    mask = str_idx.str.contains(key.lower(), regex=False, na=False)
-                    if mask.any():
-                        val = df[mask].iloc[0, idx]
-                        if pd.notna(val): return float(val)
-            except Exception: pass
-            return 0
-
-        ni = get_val(inc, ['Net Income'])
-        ta_cur = get_val(bs, ['Total Assets'])
-        cfo = get_val(cf, ['Operating Cash Flow', 'Cash Flow From Operating Activities', 'Net Cash Provided By Operating Activities'])
-        lt_debt = get_val(bs, ['Long Term Debt'])
-        cur_assets = get_val(bs, ['Current Assets', 'Total Current Assets'])
-        cur_liab = get_val(bs, ['Current Liabilities', 'Total Current Liabilities'])
-        shares = get_val(bs, ['Ordinary Shares Number', 'Basic Average Shares', 'Share Issued'])
-        gp = get_val(inc, ['Gross Profit', 'Total Gross Profit'])
-        rev = get_val(inc, ['Total Revenue', 'Operating Revenue', 'Revenue'])
-        
-        ni_prev = get_val(inc, ['Net Income'], 1)
-        ta_prev = get_val(bs, ['Total Assets'], 1)
-        lt_debt_prev = get_val(bs, ['Long Term Debt'], 1)
-        cur_assets_prev = get_val(bs, ['Current Assets', 'Total Current Assets'], 1)
-        cur_liab_prev = get_val(bs, ['Current Liabilities', 'Total Current Liabilities'], 1)
-        shares_prev = get_val(bs, ['Ordinary Shares Number', 'Basic Average Shares', 'Share Issued'], 1)
-        gp_prev = get_val(inc, ['Gross Profit', 'Total Gross Profit'], 1)
-        rev_prev = get_val(inc, ['Total Revenue', 'Operating Revenue', 'Revenue'], 1)
-
-        roa = ni / ta_cur if ta_cur else 0
-        roa_prev = ni_prev / ta_prev if ta_prev else 0
-        if roa > 0: f_score += 1
-        if cfo > 0: f_score += 1
-        if roa > roa_prev: f_score += 1
-        if cfo > ni: f_score += 1
-
-        lev = lt_debt / ta_cur if ta_cur else 0
-        lev_prev = lt_debt_prev / ta_prev if ta_prev else 0
-        if lev < lev_prev: f_score += 1
-        
-        cr = cur_assets / cur_liab if cur_liab else 0
-        cr_prev = cur_assets_prev / cur_liab_prev if cur_liab_prev else 0
-        if cr > cr_prev: f_score += 1
-        
-        if shares > 0 and shares_prev > 0 and shares <= shares_prev: f_score += 1
-        
-        gm = gp / rev if rev else 0
-        gm_prev = gp_prev / rev_prev if rev_prev else 0
-        if gm > gm_prev: f_score += 1
-        
-        ato = rev / ta_cur if ta_cur else 0
-        ato_prev = rev_prev / ta_prev if ta_prev else 0
-        if ato > ato_prev: f_score += 1
-
-        return f_score
-    except Exception: return "N/A"
-
 def analyze_fundamentals(symbol, tech_info, regime, io_executor, portfolio_state):
-    close_price = tech_info.get('close', 0.0)
-    atr = tech_info.get('atr', 0.0)
-    entry_trigger = tech_info.get('triggers', '')
-    
+    close_price, atr, entry_trigger, is_warmup = tech_info.get('close', 0.0), tech_info.get('atr', 0.0), tech_info.get('triggers', ''), tech_info.get('is_warmup', False)
     time.sleep(random.uniform(Config.SLEEP_MIN, Config.SLEEP_MAX))
     for attempt in range(2):
         try:
             ticker = yf.Ticker(symbol, session=get_session())
-            
-            try:
-                market_cap = float(ticker.fast_info.market_cap)
-            except Exception:
-                market_cap = 0
-                
-            if not market_cap or not (Config.MARKET_CAP_MIN < market_cap < Config.MARKET_CAP_MAX): 
-                return None
-
-            info = {}
-            for _ in range(2):
-                try:
-                    info = ticker.info
-                    if info: break
-                except Exception:
-                    time.sleep(random.uniform(1.0, 2.5))
-                    
-            if not info or 'longName' not in info: return None
-
-            sector = info.get('sector', 'Unknown')
-            revenue_growth = info.get('revenueGrowth')
-            gross_margin = info.get('grossMargins')
-            inst_held = info.get('heldPercentInstitutions', 0.0) + info.get('heldPercentInsiders', 0.0)
-            
-            op_margin = info.get('operatingMargins')
-            if op_margin is None: 
-                op_margin = (gross_margin - 0.20) if gross_margin else 0.0
-                
+            mcap = float(ticker.fast_info.market_cap)
+            if not (Config.MARKET_CAP_MIN < mcap < Config.MARKET_CAP_MAX): return None
+            info = ticker.info
+            sector, revenue_growth, gross_margin = info.get('sector', 'Unknown'), info.get('revenueGrowth'), info.get('grossMargins')
+            inst_held = (info.get('heldPercentInstitutions') or 0.0) + (info.get('heldPercentInsiders') or 0.0)
+            op_margin = info.get('operatingMargins') or ((gross_margin - 0.20) if gross_margin else 0.0)
             rule_of_40 = ((revenue_growth or 0) + op_margin) * 100
-            is_rule_of_40_pass = rule_of_40 >= 40.0
+            is_hyper, is_r40, tech_score = (revenue_growth and revenue_growth >= Config.HYPER_GROWTH_THRESHOLD), (rule_of_40 >= 40.0), tech_info.get('tech_score', 0)
             
-            tech_score = tech_info.get('tech_score', 0)
-            is_hyper_growth = revenue_growth is not None and revenue_growth >= Config.HYPER_GROWTH_THRESHOLD
-            
-            has_momentum_privilege = True
-            
-            is_growth_exempt = is_hyper_growth or has_momentum_privilege or is_rule_of_40_pass
-            req_growth = 0.0 if is_growth_exempt else Config.REVENUE_GROWTH_MIN
-            req_margin = 0.05 if is_growth_exempt else 0.20
-            req_f_score = 0 if is_growth_exempt else Config.F_SCORE_MIN
-            
-            if revenue_growth is None and has_momentum_privilege: revenue_growth = req_growth
-            if gross_margin is None and has_momentum_privilege: gross_margin = req_margin
-            
+            # 动能豁免底线
+            req_growth = 0.0 if (is_hyper or is_r40 or tech_score >= 3) else Config.REVENUE_GROWTH_MIN
             if revenue_growth is None or revenue_growth < req_growth: return None
-            if gross_margin is None or gross_margin < req_margin: return None
 
-            inc, bs, cf = ticker.income_stmt, ticker.balance_sheet, ticker.cashflow
+            # 抓取季度加速度
             q_inc = ticker.quarterly_income_stmt
-            
             rev_accel, margin_exp = False, False
             if q_inc is not None and not q_inc.empty:
                 try:
-                    rev_row = next((q_inc.loc[k] for k in ['Total Revenue', 'Operating Revenue', 'Revenue'] if k in q_inc.index), None)
-                    gp_row = next((q_inc.loc[k] for k in ['Gross Profit', 'Total Gross Profit'] if k in q_inc.index), None)
-                    
-                    if rev_row is not None and len(rev_row.dropna()) >= 3:
-                        revs = rev_row.dropna().values
-                        g1 = (revs[0] - revs[1]) / revs[1] if revs[1] else 0
-                        g2 = (revs[1] - revs[2]) / revs[2] if revs[2] else 0
-                        if g1 > g2 > 0 and revs[0] > revs[2]: rev_accel = True
-                        
-                    if gp_row is not None and rev_row is not None and len(gp_row.dropna()) >= 2 and len(rev_row.dropna()) >= 2:
-                        gps = gp_row.dropna().values
-                        rvs = rev_row.dropna().values
-                        m1 = gps[0] / rvs[0] if rvs[0] else 0
-                        m2 = gps[1] / rvs[1] if rvs[1] else 0
-                        if m1 > m2 > 0: margin_exp = True
-                except Exception: pass
-            
-            if (revenue_growth is None or gross_margin is None) and not inc.empty:
-                try:
-                    rev_row = next((inc.loc[k] for k in ['Total Revenue', 'Operating Revenue', 'Revenue'] if k in inc.index), None)
-                    gp_row = next((inc.loc[k] for k in ['Gross Profit', 'Total Gross Profit'] if k in inc.index), None)
-                    if revenue_growth is None and rev_row is not None and len(rev_row.dropna()) >= 2:
-                        rv = rev_row.dropna()
-                        try: rv.index = pd.to_datetime(rv.index); rv = rv.sort_index(ascending=False)
-                        except: pass
-                        if rv.iloc[1] > 0: revenue_growth = (rv.iloc[0] - rv.iloc[1]) / rv.iloc[1]
-                    if gross_margin is None and gp_row is not None and rev_row is not None:
-                        gp, rv = gp_row.dropna(), rev_row.dropna()
-                        if len(gp) > 0 and len(rv) > 0 and rv.iloc[0] > 0: gross_margin = gp.iloc[0] / rv.iloc[0]
+                    revs = q_inc.loc[['Total Revenue', 'Operating Revenue', 'Revenue']].dropna().iloc[0].values
+                    if len(revs) >= 3 and (revs[0]-revs[1])/revs[1] > (revs[1]-revs[2])/revs[2]: rev_accel = True
                 except Exception: pass
 
-            if revenue_growth is None or revenue_growth < req_growth: return None
-            if gross_margin is None or gross_margin < req_margin: return None
-            
-            f_score = calculate_piotroski_f_score(bs, cf, inc)
-            if not isinstance(f_score, int):
-                if is_growth_exempt: 
-                    f_score = req_f_score
-                else:
-                    return None
-            elif f_score < req_f_score: 
-                return None
+            f_score = calculate_piotroski_f_score(ticker.balance_sheet, ticker.cashflow, ticker.income_stmt)
+            if not (is_hyper or is_r40 or tech_score >= 3) and (not isinstance(f_score, int) or f_score < Config.F_SCORE_MIN): return None
 
-            options_flow = analyze_options_flow(symbol, io_executor)
-            catalyst = analyze_catalyst(symbol, io_executor)
-            insider_trading = analyze_insider_trading(symbol, io_executor)
-            reddit_score, reddit_signal = analyze_social_sentiment(symbol, io_executor)
-            
-            if '⛔ 致命警报' in catalyst: 
-                logging.info(f"🚫 触发单票熔断: [{symbol}] {catalyst}")
-                return None
+            options_flow, catalyst, insider, reddit_score, reddit_signal = analyze_options_flow(symbol, io_executor), analyze_catalyst(symbol, io_executor), analyze_insider_trading(symbol, io_executor), *analyze_social_sentiment(symbol, io_executor)
+            if '⛔' in catalyst: return None
 
-            short_float = info.get('shortPercentOfFloat')
-            if short_float is None:
-                short_int, shares_out = info.get('shortInterest'), info.get('sharesOutstanding')
-                if short_int and shares_out and shares_out > 0: short_float = short_int / shares_out
-
-            squeeze_signal = "无"
-            if short_float is not None:
-                if short_float >= Config.SHORT_FLOAT_MIN: squeeze_signal = f"🩸 世纪轧空 ({short_float:.1%})"
-                elif short_float >= 0.10: squeeze_signal = f"⚠️ 高度做空 ({short_float:.1%})"
-
-            comp_score = 0
-            if f_score >= req_f_score and not is_growth_exempt:
-                comp_score += (f_score - req_f_score)
-                
-            comp_score += tech_score
+            comp_score = tech_score + (2 if is_r40 else 0) + (2 if rev_accel else 0) + (1 if inst_held > 0.20 else 0) + max(reddit_score, (2 if '🔥' in options_flow else 0))
             
-            if is_rule_of_40_pass: comp_score += 2
-            if is_hyper_growth or has_momentum_privilege: comp_score += 1
-            if '🦄' in catalyst: comp_score += 4  
-            
-            if rev_accel: comp_score += 2
-            if margin_exp: comp_score += 1
-            if inst_held > 0.20: comp_score += 1
-            
-            options_bonus = 2 if '🔥' in options_flow else (1 if '⚠️' in options_flow else 0)
-            hype_factor = max(reddit_score, options_bonus)
-            comp_score += hype_factor
-            
-            if '🚀' in catalyst: comp_score += 1
-            try:
-                if '情绪' in catalyst:
-                    score_match = re.search(r'情绪(\d+)', catalyst)
-                    if score_match and int(score_match.group(1)) >= 80: 
-                        comp_score += 1
-            except Exception: pass
-                    
-            if '🚨' in insider_trading: comp_score += 2
-            if '🩸' in squeeze_signal: comp_score += 2
-            elif '⚠️' in squeeze_signal: comp_score += 1
-
-            atr_pct = atr / close_price if close_price > 0 else 0
-            base_atr_mult = 2.0 if atr_pct > 0.05 else Config.ATR_MULTIPLIER
-            actual_atr_mult = (base_atr_mult * 0.7) if regime == 'YELLOW' else base_atr_mult
-            actual_risk_pct = (Config.RISK_PER_TRADE / 2.0) if regime == 'YELLOW' else Config.RISK_PER_TRADE
-            
-            stop_loss = close_price - (actual_atr_mult * atr)
-            risk_amount = Config.PORTFOLIO_VALUE * actual_risk_pct
-            
-            stop_loss_dist = close_price - stop_loss
-            target_raw_shares = 0
-            if atr > 0 and close_price > 0 and stop_loss_dist > 0.01:
-                target_raw_shares = int(risk_amount / stop_loss_dist)
-                max_pos_val = Config.PORTFOLIO_VALUE * (0.125 if regime == 'YELLOW' else 0.25)
-                if (target_raw_shares * close_price) > max_pos_val:
-                    target_raw_shares = int(max_pos_val / close_price)
-                    
-            if target_raw_shares <= 0: return None
-            
-            shares_to_buy = 0
-            action_tag = ""
-            target_value = target_raw_shares * close_price
-            
-            if symbol in portfolio_state['holdings']:
-                held_info = portfolio_state['holdings'][symbol]
-                profit_pct = (close_price - held_info['cost_basis']) / held_info['cost_basis']
-                current_value = held_info['shares'] * close_price
-                
-                if profit_pct >= 0.15 and current_value < target_value * 0.85:
-                    shares_to_buy = int(target_raw_shares * 0.20)
-                    action_tag = f"🔼加仓(浮盈{profit_pct:.1%}, 追加最后20%)"
-                elif profit_pct >= 0.10 and current_value < target_value * 0.55:
-                    shares_to_buy = int(target_raw_shares * 0.30)
-                    action_tag = f"🔼加仓(浮盈{profit_pct:.1%}, 追加30%)"
-                else:
-                    return None 
-            else:
-                shares_to_buy = int(target_raw_shares * 0.50)
-                action_tag = "🆕建仓(首发50%)"
-                
-            if shares_to_buy <= 0: return None
-            
-            available_sector_cash = (Config.PORTFOLIO_VALUE * Config.MAX_SECTOR_WEIGHT) - portfolio_state['sector_exposure'].get(sector, 0.0)
-            cost_est = shares_to_buy * close_price
-            
-            if available_sector_cash <= 0:
-                logging.info(f"🚫 {symbol} 被风控拦截: [{sector}] 行业集中度已达 {Config.MAX_SECTOR_WEIGHT:.0%} 上限。")
-                return None
-            elif cost_est > available_sector_cash:
-                shares_to_buy = int(available_sector_cash / close_price)
-                if shares_to_buy <= 0: return None
-                action_tag += " [受限于行业上限降档]"
-
-            core_tags = []
-            if rev_accel: core_tags.append("🔥营收加速(QoQ)")
-            if margin_exp: core_tags.append("📈毛利扩张")
-            if inst_held > 0.20: core_tags.append(f"🏦大资金入驻({inst_held:.1%})")
-            core_str = " | ".join(core_tags) if core_tags else "基本面平稳"
+            # 仓位计算 (针对 warmup 标的不计算建议股数)
+            shares_to_buy, action_tag, stop_loss = 0, "🔭 观察等待点火", close_price - (Config.ATR_MULTIPLIER * atr)
+            if not is_warmup:
+                target_raw = int((Config.PORTFOLIO_VALUE * Config.RISK_PER_TRADE) / (close_price - stop_loss))
+                shares_to_buy = int(target_raw * (0.5 if symbol not in portfolio_state['holdings'] else 0.3))
+                action_tag = "🆕建仓(首发50%)" if symbol not in portfolio_state['holdings'] else "🔼加仓确认"
+                # 行业集中度拦截
+                if portfolio_state['sector_exposure'].get(sector, 0.0) >= Config.PORTFOLIO_VALUE * Config.MAX_SECTOR_WEIGHT: return None
 
             return {
-                '股票代码': symbol, '公司名称': info.get('longName', symbol), '行业': sector,
-                '市值(亿美元)': round(market_cap / 1e8, 2), '营收增速': f"{revenue_growth:.1%}",
-                'F-Score': f"{f_score}/9", '综合得分': comp_score, '期权异动': options_flow,
-                '催化剂': catalyst, '散户情绪': reddit_signal, '内幕交易': insider_trading, '轧空雷达': squeeze_signal,
-                '最新收盘价': round(close_price, 2), '止损价': round(stop_loss, 2),
-                '建议股数': shares_to_buy, 'F_Score_raw': f_score, 'gross_margin': gross_margin,
-                'revenue_growth_raw': revenue_growth, '核心质地': core_str, 'rule_of_40': rule_of_40,
-                '买入触发': entry_trigger, '交易动作': action_tag
+                '股票代码': symbol, '公司名称': info.get('longName', symbol), '行业': sector, '市值(亿)': round(mcap/1e8, 2),
+                '综合得分': comp_score, '最新收盘价': round(close_price, 2), '建议股数': shares_to_buy, '交易动作': action_tag,
+                '买入触发': entry_trigger, '核心质地': f"R40: {rule_of_40:.1f}% | 加速: {rev_accel} | 机构: {inst_held:.1%}",
+                '筛选理由': f"得分:{comp_score} | {reddit_signal} | {options_flow} | {catalyst}", 'is_warmup': is_warmup
             }
         except Exception:
-            if hasattr(thread_local, "session"):
-                try: thread_local.session.close()
-                except: pass
-                del thread_local.session
             if attempt == 1: return None
 
 # ==========================================
-# 自动复盘与主干逻辑
+# 自动复盘与推送系统
 # ==========================================
 def run_auto_backtest():
     try:
-        if not os.path.exists('growth_hunter_signals.db'): return ""
-        df_db = pd.read_sql_query("SELECT * FROM signals", sqlite3.connect('growth_hunter_signals.db'))
+        conn = sqlite3.connect('growth_hunter_signals.db')
+        df_db = pd.read_sql_query("SELECT * FROM signals", conn)
         if df_db.empty: return ""
-        
         df_db['date'] = pd.to_datetime(df_db['date'])
         unique_dates = sorted(df_db['date'].dt.date.unique(), reverse=True)
         if len(unique_dates) <= 1: return "\n📊 【复盘战报】: 数据积累中。\n"
         
-        report, backtest_tasks, tickers_to_fetch = "\n📊 【系统真实回测战报 (排除前视偏差)】\n", {}, set()
+        report, tickers_to_fetch = "\n📊 【系统真实回测战报 (排除前视偏差)】\n", set(df_db['symbol'].tolist())
+        current_data = yf.download(list(tickers_to_fetch), period="1mo", group_by="ticker", progress=False)
+        
         for label, n in {'T+1': 1, 'T+5': 5, 'T+20': 20}.items():
             valid_dates = [d for d in unique_dates if d <= (pd.to_datetime(unique_dates[0]) - pd.offsets.BDay(n)).date()]
             if valid_dates:
                 signals = df_db[df_db['date'].dt.date == valid_dates[0]]
-                if not signals.empty:
-                    backtest_tasks[label] = signals
-                    tickers_to_fetch.update(signals['symbol'].tolist())
-                    
-        if not tickers_to_fetch: return ""
-        
-        current_data = yf.download(list(tickers_to_fetch), period="1mo", group_by="ticker", threads=True)
-        
-        for label, signals in backtest_tasks.items():
-            wins, total, returns = 0, 0, []
-            for _, row in signals.iterrows():
-                sym = row['symbol']
-                try:
-                    df_sym = current_data[sym].dropna() if isinstance(current_data.columns, pd.MultiIndex) else current_data.dropna()
-                    if df_sym.empty: continue
-                    
-                    signal_date = pd.to_datetime(row['date']).tz_localize(None)
-                    df_post = df_sym[df_sym.index.tz_localize(None) >= signal_date]
-                    if df_post.empty: continue
-                    
-                    cost_price = row['close_price']
-                    if cost_price <= 0: continue
-                    
-                    min_low = df_post['Low'].min()
-                    current_close = float(df_post['Close'].iloc[-1])
-                    
-                    if min_low <= cost_price * 0.85:
-                        ret = -0.15 
-                    else:
-                        ret = (current_close - cost_price) / cost_price
-                        
-                    returns.append(ret)
-                    if ret > 0: wins += 1
-                    total += 1
-                except: pass
-                
-            if total > 0:
-                target_date_str = signals['date'].iloc[0].strftime('%m-%d')
-                actual_days = (datetime.now().date() - pd.to_datetime(signals['date'].iloc[0]).date()).days
-                report += f" • {label} ({target_date_str}推, 持仓{actual_days}天, {total}只): 胜率 {wins/total:.0%} | 平均真实收益 {sum(returns)/total:+.1%}\n"
+                wins, total, rets = 0, 0, []
+                for _, row in signals.iterrows():
+                    try:
+                        df_post = current_data[row['symbol']][pd.to_datetime(current_data[row['symbol']].index).tz_localize(None) >= row['date']]
+                        if df_post.empty: continue
+                        ret = -0.15 if df_post['Low'].min() <= row['close_price']*0.85 else (df_post['Close'].iloc[-1]-row['close_price'])/row['close_price']
+                        rets.append(ret); total += 1
+                        if ret > 0: wins += 1
+                    except: pass
+                if total > 0: report += f" • {label} ({valid_dates[0].strftime('%m-%d')}, {total}只): 胜率 {wins/total:.0%} | 收益 {sum(rets)/total:+.1%}\n"
         return report
-    except Exception as e: return f"\n⚠️ 复盘异常: {e}\n"
+    except Exception: return ""
 
 def send_notifications(df, sell_report="", backtest_report=""):
-    if df.empty and not backtest_report and not sell_report: return logging.info("📭 今日无任何异动或复盘。")
-        
-    # 【修复】：将 AI 关键词注入大标题，满足钉钉机器人的自定义关键词安全校验
-    summary = f"🚀 [AI] GrowthHunter V10.0 (持仓调配全闭环)\n\n" 
-    if sell_report:
-        summary += sell_report
-        
-    summary += (f"【新增捕获】 {len(df)} 只带有精确点火信号的起爆股：\n\n" if not df.empty else "今日无新增达标买入标的。\n\n")
-    for _, row in df.head(10).iterrows():
-        item = f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
-        if len(summary) + len(item) > 3500: summary += "...（已自动截断）\n\n"; break
-        summary += item
+    if df.empty and not backtest_report and not sell_report: return
+    summary = f"🚀 [AI] GrowthHunter V10.0 (阶梯捕获闭环)\n\n" 
+    if sell_report: summary += sell_report
+    
+    # 拆分 精选买入 vs 潜力观察
+    buy_df = df[df['is_warmup'] == False]
+    watch_df = df[df['is_warmup'] == True]
+    
+    if not buy_df.empty:
+        summary += "🔥 **【精选买入指令】**\n"
+        for _, row in buy_df.head(5).iterrows():
+            summary += f"• [{row['股票代码']}] {row['公司名称']}\n  └ 触发: {row['买入触发']} | 动作: {row['交易动作']} {row['建议股数']}股\n  └ 理由: {row['核心质地']}\n\n"
+            
+    if not watch_df.empty:
+        summary += "🔭 **【潜力观察名单 (等待点火)】**\n"
+        for _, row in watch_df.head(5).iterrows():
+            summary += f"• [{row['股票代码']}] RS极强且质地优异，待点火信号\n"
+            
     summary += backtest_report
-        
-    status_report = []
     for platform, env_key in [('微信', 'SERVERCHAN_KEY'), ('飞书', 'FEISHU_WEBHOOK'), ('钉钉', 'DINGTALK_WEBHOOK'), ('Telegram', 'TELEGRAM_TOKEN')]:
         val = os.getenv(env_key)
-        if not val: status_report.append(f"⚪ {platform}: 未配置"); continue
+        if not val: continue
         try:
-            if platform == '微信': res = requests.get(f"https://sctapi.ftqq.com/{val}.send", params={"title": "🚀 [AI] V10.0 起爆预警", "desp": summary}, timeout=10)
-            elif platform == 'Telegram':
-                chat_id = os.getenv('TELEGRAM_CHAT_ID')
-                if not chat_id: status_report.append(f"⚪ Telegram: 缺 CHAT_ID"); continue
-                links = re.findall(r'\[.*?\]\(.*?\)', summary)
-                temp = summary
-                for i, link in enumerate(links): temp = temp.replace(link, f"@@LINKPLACEHOLDER_{i}@@")
-                tg_sum = temp.replace('_', '\\_').replace('*', '\\*')
-                for i, link in enumerate(links): tg_sum = tg_sum.replace(f"@@LINKPLACEHOLDER_{i}@@", link)
-                res = requests.post(f"https://api.telegram.org/bot{val}/sendMessage", json={"chat_id": chat_id, "text": tg_sum, "parse_mode": "Markdown"}, timeout=10)
-            else:
-                res = requests.post(val, json=({"msg_type": "text", "content": {"text": summary}} if platform == '飞书' else {"msgtype": "text", "text": {"content": summary}}), timeout=10)
-            status_report.append(f"✅ {platform}: 成功" if res.status_code == 200 else f"❌ {platform}: 异常 ({res.text})")
-        except Exception as e: status_report.append(f"❌ {platform}: 失败 ({e})")
+            if platform == '微信': requests.get(f"https://sctapi.ftqq.com/{val}.send", params={"title": "🚀 [AI] 起爆预警", "desp": summary}, timeout=10)
+            elif platform == 'Telegram': requests.post(f"https://api.telegram.org/bot{val}/sendMessage", json={"chat_id": os.getenv('TELEGRAM_CHAT_ID'), "text": summary.replace('_', '\\_'), "parse_mode": "Markdown"}, timeout=10)
+            else: requests.post(val, json=({"msg_type": "text", "content": {"text": summary}} if platform == '飞书' else {"msgtype": "text", "text": {"content": summary}}), timeout=10)
+        except: pass
 
-    logging.info("\n" + "="*30 + "\n 📢 推送汇总\n" + "="*30)
-    for s in status_report: logging.info(s)
-    logging.info("="*30 + "\n")
-
+# ==========================================
+# 系统主干
+# ==========================================
 def main(dry_run=False, input_file=None):
-    logging.info("="*40 + " 🚀 GrowthHunter V10.0 (全生命周期调仓版) " + "="*40)
-    if dry_run: logging.info("🏃 【DRY-RUN 空跑模式启动】")
-    
+    logging.info("="*40 + " 🚀 GrowthHunter V10.0 (阶梯捕获版) " + "="*40)
     init_db()
-    
     sell_report = "" if dry_run else review_portfolio()
-    
     regime, macro_reason = check_macro_regime()
     if regime == 'RED':
-        logging.warning("🛑 宏观红灯，触发系统熔断！")
-        if not dry_run:
-            bt_report = run_auto_backtest()
-            send_notifications(pd.DataFrame(), sell_report, f"🚨 **大盘红灯熔断警告**\n{macro_reason}\n\n🛑 **防守指令**：今日暂停买入操作，注意破位止损！\n\n{bt_report}")
+        if not dry_run: send_notifications(pd.DataFrame(), sell_report, f"🚨 **大盘红灯熔断**\n{macro_reason}\n\n{run_auto_backtest()}")
         return
-    elif regime == 'YELLOW':
-        logging.warning(f"⚠️ 宏观黄灯警告：{macro_reason}")
 
     tickers = get_small_cap_tickers(input_file=input_file)
-    if not tickers: return
-
     passed_tech_tickers, tech_data_dict = batch_technical_screen(tickers)
     
-    final_selected = []
-
     if not passed_tech_tickers:
-        logging.info("📉 今日无新标的通过入场触发器初筛。")
         df = pd.DataFrame()
     else:
         results = []
-        logging.info(f"⏳ 第二阶段：深挖 {len(passed_tech_tickers)} 只新标的财务、期权、散户情绪与风投叙事...")
-        
-        remaining_cash, current_holdings, sector_exposure = get_portfolio_state()
-        portfolio_state = {'holdings': current_holdings, 'sector_exposure': sector_exposure}
-        
+        rem_cash, cur_h, sec_e = get_portfolio_state()
+        portfolio_state = {'holdings': cur_h, 'sector_exposure': sec_e}
         with ThreadPoolExecutor(max_workers=Config.IO_WORKERS) as io_exec:
             with ThreadPoolExecutor(max_workers=Config.THREAD_WORKERS) as executor:
-                futures = {executor.submit(analyze_fundamentals, sym, tech_data_dict.get(sym, {'close': 0.0, 'atr': 0.0, 'tech_score': 0}), regime, io_exec, portfolio_state): sym for sym in passed_tech_tickers}
+                futures = {executor.submit(analyze_fundamentals, sym, tech_data_dict.get(sym), regime, io_exec, portfolio_state): sym for sym in passed_tech_tickers}
                 for f in as_completed(futures):
                     res = f.result()
                     if res: results.append(res)
         df = pd.DataFrame(results)
 
     if not df.empty:
-        df = df.sort_values(by=['综合得分', '市值(亿美元)'], ascending=[False, True])
-        
-        logging.info(f"💵 当前组合剩余可用资金: ${remaining_cash:.2f} / 初始净值 ${Config.PORTFOLIO_VALUE:.2f}")
-        
-        for _, row in df.iterrows():
-            shares = row['建议股数']
-            price = row['最新收盘价']
-            slippage_price = price * 1.015
-            cost = shares * slippage_price
-            
-            if shares > 0 and remaining_cash >= cost:
-                remaining_cash -= cost
-                shares_str = f"{int(shares)} 股"
-            elif shares > 0 and remaining_cash >= slippage_price:
-                affordable_shares = int(remaining_cash / slippage_price)
-                cost = affordable_shares * slippage_price
-                remaining_cash -= cost
-                shares_str = f"{affordable_shares} 股 (受总资金限制调减)"
-                row['建议股数'] = affordable_shares 
-            else:
-                shares_str = "资金耗尽，暂不买入"
-                cost = 0
-                row['建议股数'] = 0 
-                
-            reasons = (
-                f"R40法则: {row['rule_of_40']:.1f}% | 增速: {row['revenue_growth_raw']:.1%} | F-Score: {row['F_Score_raw']}/9\n"
-                f"  └ ⚡ 触发: {row['买入触发']}\n"
-                f"  └ 💎 质地: {row['核心质地']}\n"
-                f"  └ 🛡️ 风控: {row['交易动作']} {shares_str} | 破位止损 ${row['止损价']:.2f} | 预估动用 ${cost:.2f}\n"
-                f"  └ 🎲 另类: {row['期权异动']} | {row['散户情绪']}\n"
-                f"  └ 📰 消息: {row['催化剂']}\n"
-                f"  └ 🩸 筹码: {row['内幕交易']} | {row['轧空雷达']}"
-            )
-            row['筛选理由'] = reasons
-            row['链接'] = f"https://finance.yahoo.com/quote/{row['股票代码']}"
-            final_selected.append(row)
-            
-        df = pd.DataFrame(final_selected)
-        df = df.drop(columns=['止损价', '建议股数', 'F_Score_raw', 'gross_margin', 'revenue_growth_raw', 'rule_of_40', '核心质地', '买入触发', '交易动作', '行业'], errors='ignore')
-
+        df = df.sort_values(by=['is_warmup', '综合得分'], ascending=[True, False])
         md_df = df.copy()
         md_df['股票代码'] = md_df['股票代码'].apply(lambda x: f"[{x}](https://finance.yahoo.com/quote/{x})")
         df.to_csv('growth_hunter_results.csv', index=False)
-        with open('growth_hunter_results.md', 'w', encoding='utf-8') as f: f.write(f"# 🚀 GrowthHunter 严选报告\n\n**生成时间**：{datetime.now()}\n\n{md_df.to_markdown(index=False)}")
-        logging.info(f"🎉 大功告成！捕获 {len(df)} 只硬核标的。")
-    
-    if not dry_run:
-        save_signals_to_db(df, len(tickers), len(passed_tech_tickers))
-        update_portfolio(final_selected)
-        backtest_report = run_auto_backtest()
-        send_notifications(df, sell_report, backtest_report)
-
-def test_notifications():
-    logging.info("🔧 推送测试...")
-    init_db()
-    save_signals_to_db(pd.DataFrame([{'股票代码': 'TEST', '公司名称': '配置测试股', '市值(亿美元)': 8.8, '营收增速': '50%', 'F-Score': '9/9', '综合得分': 7, '期权异动': '🔥 爆单', '催化剂': '🚀 情绪95 [财报超预期] 利润翻倍指引上调', '散户情绪': '🦍 极度狂热', '内幕交易': '🚨 买入', '轧空雷达': '🩸 轧空', '最新收盘价': 100.5, '买入触发': '🎯枢轴突破 | 🚀强势缺口', '核心质地': '🔥营收加速', '交易动作': '🆕建仓(首发50%)', '行业': 'Technology', '筛选理由': 'V10.0 Reddit 引擎就绪！', 'data_tag': ''}]), 1, 1)
-    send_notifications(pd.DataFrame(), "♻️ **【组合动态调仓与止盈防线】**\n  └ 卖出 [TEST] (🏆 追踪止盈 (高点回撤20%, 巅峰$120.00)): 成本 $50 -> 卖价 $96 (盈亏: +92.0%, 回笼: $14400.00)\n\n", "\n📊 【AI战报】\n • T+1 (推 3只): 胜率 67% | 均收益 +4.2%\n")
+        with open('growth_hunter_results.md', 'w', encoding='utf-8') as f: f.write(f"# 🚀 GrowthHunter 阶梯研报\n\n{md_df.to_markdown(index=False)}")
+        if not dry_run:
+            save_signals_to_db(df[df['is_warmup']==False], len(tickers), len(passed_tech_tickers))
+            update_portfolio(df[df['is_warmup']==False])
+            send_notifications(df, sell_report, run_auto_backtest())
+    else:
+        logging.info("📭 今日无任何新增或观察标的。")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -1247,5 +769,4 @@ if __name__ == "__main__":
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--input', type=str, default=None)
     args, _ = parser.parse_known_args()
-    
-    test_notifications() if args.test else main(dry_run=args.dry_run, input_file=args.input)
+    main(dry_run=args.dry_run, input_file=args.input)
