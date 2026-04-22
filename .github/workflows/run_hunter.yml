@@ -1,94 +1,95 @@
 name: 🚀 每日运行 GrowthHunter
 
 on:
-schedule:
-# 调整为 UTC 22:30 (北京时间次日凌晨 6:30)，确保 Yahoo 数据刷新
-- cron: '30 22 * * 1-5'
-workflow_dispatch:
-inputs:
-test_mode:
-description: '🧪 仅测试推送配置'
-required: false
-type: boolean
-default: false
-dry_run:
-description: '🏃 空跑模式 (仅选股，不发推送)'
-required: false
-type: boolean
-default: false
+  schedule:
+    # 调整为 UTC 22:30 (北京时间次日凌晨 6:30)，确保 Yahoo 数据刷新
+    - cron: '30 22 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: '🧪 仅测试推送配置'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: '🏃 空跑模式 (仅选股，不发推送)'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-group: ${{ github.workflow }}-${{ github.ref }}
-cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
-contents: read
+  contents: read
 
 jobs:
-run-bot:
-runs-on: ubuntu-latest
-timeout-minutes: 120
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
 
-steps:
-- name: 检出代码
-  uses: actions/checkout@v4
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
 
-- name: 设置 Python 环境
-  uses: setup-python@v5
-  with:
-    python-version: '3.12'
+    - name: 设置 Python 环境
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
 
-- name: 缓存 Python 依赖
-  uses: actions/cache@v4
-  with:
-    path: ~/.cache/pip
-    key: ${{ runner.os }}-pip-${{ hashFiles('.github/workflows/run_hunter.yml') }}
-    restore-keys: |
-      ${{ runner.os }}-pip-
+    - name: 缓存 Python 依赖
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('.github/workflows/run_hunter.yml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
 
-- name: 环境检查与依赖安装
-  run: |
-    python -m pip install --upgrade pip
-    pip install yfinance pandas pandas-ta requests lxml html5lib tabulate google-genai praw
+    - name: 环境检查与依赖安装
+      run: |
+        python -m pip install --upgrade pip
+        pip install yfinance pandas pandas-ta requests lxml html5lib tabulate google-genai praw
 
-- name: ⬇️ 下载历史数据库与股票池缓存
-  uses: dawidd6/action-download-artifact@v3
-  continue-on-error: true
-  with:
-    github_token: ${{secrets.GITHUB_TOKEN}}
-    workflow: run_hunter.yml
-    workflow_conclusion: success
-    name_is_regexp: true
-    name: growth-hunter-artifacts-.*
-    path: .
+    - name: ⬇️ 下载历史数据库与股票池缓存
+      uses: dawidd6/action-download-artifact@v3
+      continue-on-error: true
+      with:
+        github_token: ${{secrets.GITHUB_TOKEN}}
+        workflow: run_hunter.yml
+        workflow_conclusion: success
+        name_is_regexp: true
+        name: growth-hunter-artifacts-.*
+        path: .
 
-- name: 运行量化程序
-  env:
-    SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
-    TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-    TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-    FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-    DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-    REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }} 
-    REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-  run: |
-    if [ "${{ github.event.inputs.test_mode }}" == "true" ]; then
-      python growth_hunter_v10.py --test
-    elif [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
-      python growth_hunter_v10.py --dry-run
-    else
-      python growth_hunter_v10.py
-    fi
+    - name: 运行量化程序
+      env:
+        SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }} 
+        REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+      run: |
+        if [ "${{ inputs.test_mode }}" == "true" ]; then
+          python growth_hunter_v10.py --test
+        elif [ "${{ inputs.dry_run }}" == "true" ]; then
+          python growth_hunter_v10.py --dry-run
+        else
+          python growth_hunter_v10.py
+        fi
 
-- name: 上传归档数据与报告为构建产物
-  if: ${{ github.event.inputs.test_mode != 'true' && github.event.inputs.dry_run != 'true' }}
-  uses: actions/upload-artifact@v4
-  with:
-    name: growth-hunter-artifacts-${{ github.run_number }}
-    path: |
-      growth_hunter_signals.db
-      growth_hunter_results.csv
-      growth_hunter_results.md
-      small_cap_cache.csv
-    retention-days: 90
+    - name: 上传归档数据与报告为构建产物
+      if: ${{ inputs.test_mode != 'true' && inputs.dry_run != 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: growth-hunter-artifacts-${{ github.run_number }}
+        path: |
+          growth_hunter_signals.db
+          growth_hunter_results.csv
+          growth_hunter_results.md
+          small_cap_cache.csv
+        retention-days: 90
+```
