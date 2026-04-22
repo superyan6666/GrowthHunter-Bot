@@ -4,7 +4,8 @@
 进阶能力：全生命周期资金闭环 (动态止盈止损 + 资金复利滚动)
 行情适配：维基百科稳定股票池 + 极强动能免检特权，破除好行情踏空盲区
 深度打磨：引入 Rule of 40、合并情绪因子降噪、动态ATR、消除回测前视偏差
-核心补齐：营收加速度 (Revenue Acceleration) + 毛利扩张 + 机构持仓 + 6个月多维RS
+极致强化：严苛版营收加速度 (QoQ) + 毛利连续扩张 + 机构流向 + IBD式3重RS
+宏观雷达：流动性利差(HYG/LQD) + 强美元压制(UUP) + 风格轮动(XLK/XLE)
 """
 
 import yfinance as yf
@@ -87,38 +88,87 @@ def get_session():
     return thread_local.session
 
 # ==========================================
-# 模块 D：大盘政权与熔断体系
+# 模块 D：大盘政权与熔断体系 (多维宏观流矩阵)
 # ==========================================
 def check_macro_regime():
-    logging.info("🌍 启动风控系统：扫描宏观大盘政权 (Macro Regime)...")
+    logging.info("🌍 启动风控系统：扫描多维宏观与流动性矩阵 (Macro Regime)...")
     try:
-        macro_data = yf.download(["SPY", "IWM", "^VIX"], period="1y", group_by="ticker", progress=False)
+        # 新增流动性、汇率、板块风格代理 ETF
+        macro_tickers = ["SPY", "IWM", "^VIX", "HYG", "LQD", "UUP", "XLK", "XLE"]
+        macro_data = yf.download(macro_tickers, period="1y", group_by="ticker", progress=False)
+        
         if macro_data.empty: 
             return 'GREEN', "无法获取大盘数据，默认放行"
             
-        last_vix = float(macro_data['^VIX']['Close'].iloc[-1]) if '^VIX' in macro_data.columns.levels[0] else 20.0
-        
-        iwm_close = macro_data['IWM']['Close']
-        iwm_ma20 = float(iwm_close.rolling(20).mean().iloc[-1])
-        iwm_ma50 = float(iwm_close.rolling(50).mean().iloc[-1])
-        last_iwm = float(iwm_close.iloc[-1])
-        
-        spy_close = macro_data['SPY']['Close']
-        last_spy = float(spy_close.iloc[-1])
-        spy_ma200 = float(spy_close.rolling(200).mean().iloc[-1])
-        
-        if last_vix > 25.0:
-            return 'RED', f"VIX ({last_vix:.2f}) > 25，市场恐慌蔓延，触发红灯熔断"
-        if last_spy < spy_ma200:
-            return 'RED', f"SPY ({last_spy:.2f}) < 200MA ({spy_ma200:.2f})，熊市防御，触发红灯熔断"
-            
-        if pd.notna(iwm_ma50) and (iwm_ma20 < iwm_ma50 or last_iwm < iwm_ma50):
-            return 'YELLOW', f"小盘股趋势走坏 (IWM 20MA < 50MA 或价格跌破 50MA)，触发黄灯 (止损收紧，仓位减半)"
-        if last_vix > 20.0:
-            return 'YELLOW', f"VIX ({last_vix:.2f}) > 20，市场波动加剧，触发黄灯 (止损收紧，仓位减半)"
+        def get_close(ticker, default_val=None):
+            try:
+                if isinstance(macro_data.columns, pd.MultiIndex):
+                    if ticker in macro_data.columns.levels[0]:
+                        return macro_data[ticker]['Close'].ffill()
+                elif 'Close' in macro_data.columns and ticker in macro_tickers:
+                    return macro_data['Close'].ffill()
+            except Exception: pass
+            return pd.Series([default_val]*200) if default_val else None
 
-        logging.info(f"✅ 大盘环境安全 (VIX: {last_vix:.1f}, IWM 强势, SPY > 200MA)")
-        return 'GREEN', "宏观环境健康，绿灯亮起，全面进攻"
+        vix = get_close('^VIX', 20.0)
+        spy = get_close('SPY')
+        iwm = get_close('IWM')
+        hyg = get_close('HYG')
+        lqd = get_close('LQD')
+        uup = get_close('UUP')
+        xlk = get_close('XLK')
+        xle = get_close('XLE')
+        
+        last_vix = float(vix.iloc[-1])
+        
+        # 🔴 一级红灯熔断 (绝对熊市或极端恐慌)
+        if spy is not None:
+            spy_ma200 = float(spy.rolling(200).mean().iloc[-1])
+            last_spy = float(spy.iloc[-1])
+            if last_vix > 25.0:
+                return 'RED', f"VIX ({last_vix:.2f}) > 25，市场恐慌蔓延，触发红灯熔断"
+            if last_spy < spy_ma200:
+                return 'RED', f"SPY ({last_spy:.2f}) < 200MA ({spy_ma200:.2f})，熊市防御，触发红灯熔断"
+                
+        yellow_reasons = []
+        
+        # 🟡 传统小盘股破位
+        if iwm is not None:
+            iwm_ma20 = float(iwm.rolling(20).mean().iloc[-1])
+            iwm_ma50 = float(iwm.rolling(50).mean().iloc[-1])
+            last_iwm = float(iwm.iloc[-1])
+            if pd.notna(iwm_ma50) and (iwm_ma20 < iwm_ma50 or last_iwm < iwm_ma50):
+                yellow_reasons.append("小盘股趋势走弱(IWM破位)")
+
+        if last_vix > 20.0:
+            yellow_reasons.append(f"波动率升温(VIX>20)")
+
+        # 🟡 流动性与信用利差抽水 (HYG/LQD 比值)
+        if hyg is not None and lqd is not None:
+            cred_spread = hyg / lqd
+            cred_ma50 = float(cred_spread.rolling(50).mean().iloc[-1])
+            if cred_spread.iloc[-1] < cred_ma50:
+                yellow_reasons.append("高收益债利差走阔(资金避险)")
+
+        # 🟡 强美元估值压制 (UUP 美元基金)
+        if uup is not None:
+            uup_ma50 = float(uup.rolling(50).mean().iloc[-1])
+            if uup.iloc[-1] > uup_ma50 and uup.iloc[-1] > uup.iloc[-20]:
+                yellow_reasons.append("美元指数走强(杀估值)")
+
+        # 🟡 成长/价值 风格轮动 (XLK/XLE 比值)
+        if xlk is not None and xle is not None:
+            growth_value = xlk / xle
+            gv_ma50 = float(growth_value.rolling(50).mean().iloc[-1])
+            if growth_value.iloc[-1] < gv_ma50:
+                yellow_reasons.append("科技成长跑输能源价值(风格逆风)")
+
+        if yellow_reasons:
+            reason_str = " | ".join(yellow_reasons)
+            return 'YELLOW', f"宏观逆风警告: {reason_str} -> 触发黄灯 (止损收紧，仓位减半)"
+
+        logging.info(f"✅ 多维大盘环境安全 (VIX: {last_vix:.1f}, 流动性充裕, 成长占优)")
+        return 'GREEN', "宏观与流动性环境健康，绿灯亮起，全面进攻"
     except Exception as e:
         logging.debug(f"大盘校验异常: {e}")
         return 'GREEN', "大盘校验异常，默认放行"
@@ -588,13 +638,14 @@ def batch_technical_screen(tickers):
             squeeze_on = (bb_upper < kc_upper) & (bb_lower > kc_lower)
             is_squeeze_break = (current_close > kc_upper.iloc[idx]) and (squeeze_on.iloc[-2] if len(squeeze_on) >= 2 else False)
             
-            # 【策略修正：多时间维度相对强度 RS (50日中期 & 130日长期跑赢大盘)】
             aligned_iwm = iwm_close.reindex(df.index).interpolate(method='linear').ffill() if iwm_close is not None else df['Close'] * 0
             rs_line = df['Close'] / aligned_iwm
-            rs_sma50 = rs_line.rolling(window=50).mean()
-            rs_sma130 = rs_line.rolling(window=130).mean()
+            rs_sma50 = rs_line.rolling(window=50).mean()   # 约 2.5 个月
+            rs_sma65 = rs_line.rolling(window=65).mean()   # 约 3 个月
+            rs_sma130 = rs_line.rolling(window=130).mean() # 约 6 个月
             
             rs_condition = (rs_line.iloc[idx] > rs_sma50.iloc[idx] if not pd.isna(rs_sma50.iloc[idx]) else False) and \
+                           (rs_line.iloc[idx] > rs_sma65.iloc[idx] if not pd.isna(rs_sma65.iloc[idx]) else False) and \
                            (rs_line.iloc[idx] > rs_sma130.iloc[idx] if not pd.isna(rs_sma130.iloc[idx]) else False)
 
             has_unfilled_gap = check_unfilled_gap(df, lookback=10)
@@ -707,7 +758,8 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
 
             revenue_growth = info.get('revenueGrowth')
             gross_margin = info.get('grossMargins')
-            inst_held = info.get('heldPercentInstitutions', 0)
+            
+            inst_held = info.get('heldPercentInstitutions', 0.0) + info.get('heldPercentInsiders', 0.0)
             
             op_margin = info.get('operatingMargins')
             if op_margin is None: 
@@ -735,7 +787,6 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             inc, bs, cf = ticker.income_stmt, ticker.balance_sheet, ticker.cashflow
             q_inc = ticker.quarterly_income_stmt
             
-            # 【核心因子补齐】：提取营收加速度与毛利率扩张趋势 (近3季度环比比较)
             rev_accel, margin_exp = False, False
             if q_inc is not None and not q_inc.empty:
                 try:
@@ -746,7 +797,7 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
                         revs = rev_row.dropna().values
                         g1 = (revs[0] - revs[1]) / revs[1] if revs[1] else 0
                         g2 = (revs[1] - revs[2]) / revs[2] if revs[2] else 0
-                        if g1 > g2 > 0: rev_accel = True
+                        if g1 > g2 > 0 and revs[0] > revs[2]: rev_accel = True
                         
                     if gp_row is not None and rev_row is not None and len(gp_row.dropna()) >= 2 and len(rev_row.dropna()) >= 2:
                         gps = gp_row.dropna().values
@@ -756,7 +807,6 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
                         if m1 > m2 > 0: margin_exp = True
                 except Exception: pass
             
-            # (后置兜底)
             if (revenue_growth is None or gross_margin is None) and not inc.empty:
                 try:
                     rev_row = next((inc.loc[k] for k in ['Total Revenue', 'Operating Revenue', 'Revenue'] if k in inc.index), None)
@@ -812,7 +862,6 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             if is_hyper_growth or has_momentum_privilege: comp_score += 1
             if '🦄' in catalyst: comp_score += 4  
             
-            # 【权重注入】：新加因子赋分
             if rev_accel: comp_score += 2
             if margin_exp: comp_score += 1
             if inst_held > 0.20: comp_score += 1
@@ -850,11 +899,10 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             else:
                 raw_shares = 0
                 
-            # 【输出打磨】：整理新增维度的推送文字
             core_tags = []
-            if rev_accel: core_tags.append("🔥营收加速")
+            if rev_accel: core_tags.append("🔥营收加速(QoQ)")
             if margin_exp: core_tags.append("📈毛利扩张")
-            if inst_held > 0.20: core_tags.append(f"🏦机构持仓({inst_held:.1%})")
+            if inst_held > 0.20: core_tags.append(f"🏦大资金入驻({inst_held:.1%})")
             if has_momentum_privilege: core_tags.append("🛡️免检数据豁免")
             core_str = " | ".join(core_tags) if core_tags else "基本面平稳"
 
