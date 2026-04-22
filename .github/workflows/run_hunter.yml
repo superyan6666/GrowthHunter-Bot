@@ -52,12 +52,12 @@ jobs:
 
     - name: 环境检查与依赖安装
       # [细节优化] 打印 python 和 pip 版本，方便未来排错
-      # [V9.0 升级] 追加了 google-generativeai 库，提供大模型支持
+      # [V9.0 升级] 替换为最新的 google-genai 库，修复旧版废弃导致的报错
       run: |
         python --version
         pip --version
         python -m pip install --upgrade pip
-        pip install yfinance pandas pandas-ta requests lxml html5lib tabulate google-generativeai
+        pip install yfinance pandas pandas-ta requests lxml html5lib tabulate google-genai
 
     # 【终极补丁：记忆继承】从上一次成功的运行中下载历史数据库和缓存，实现真正的跨日增量存储
     - name: ⬇️ 下载历史数据库与股票池缓存
