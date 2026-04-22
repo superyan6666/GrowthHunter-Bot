@@ -1,8 +1,9 @@
 """
 GrowthHunter V10.0 - 终极量化引擎 (Alternative Data Edition)
 能力模块：Reddit 数据捕捉 + 散户狂热指数 + 宏观风控 + 动态止盈止损
-强化升级：同比营收加速、金字塔建仓防线、估值/财报催化因子、因子归因回测、并发锁修复
+强化升级：同比营收加速、金字塔建仓防线、估值/财报催化因子、并发锁修复
 极致校准：回归10倍股基因 (恢复 AI 催化剂排雷 + 毛利扩张 + 机构轧空雷达)
+逻辑重构：理顺漏斗秩序 (均线蓄力放行 + 基本面熔断前置 + API按需调用)
 """
 
 import yfinance as yf
@@ -93,7 +94,7 @@ def check_macro_regime():
     logging.info("🌍 启动风控系统：扫描多维宏观与流动性矩阵 (Macro Regime)...")
     try:
         macro_tickers = ["SPY", "IWM", "^VIX", "HYG", "LQD", "UUP", "XLK", "XLE"]
-        # [核心修复] 加入 threads=False，防止 yfinance 首次初始化内部 SQLite 时区缓存时触发数据库写锁冲突
+        # 加入 threads=False，防止 yfinance 首次初始化内部 SQLite 时区缓存时触发数据库写锁冲突
         macro_data = yf.download(macro_tickers, period="1y", group_by="ticker", progress=False, threads=False)
         
         if macro_data.empty: 
@@ -171,7 +172,6 @@ def check_macro_regime():
 # 模块 C：SQLite 数据库与持仓管理
 # ==========================================
 def init_db():
-    """初始化数据库架构"""
     conn = sqlite3.connect('growth_hunter_signals.db')
     c = conn.cursor()
     c.execute('''
@@ -211,7 +211,6 @@ def init_db():
     conn.close()
 
 def save_signals_to_db(df, tickers_scanned_count, passed_tech_count):
-    """保存筛选结果到数据库"""
     try:
         conn = sqlite3.connect('growth_hunter_signals.db')
         today = datetime.now().strftime('%Y-%m-%d')
@@ -248,7 +247,6 @@ def save_signals_to_db(df, tickers_scanned_count, passed_tech_count):
         logging.error(f"⚠️ 数据库保存失败: {e}")
 
 def get_portfolio_state():
-    """获取当前组合持仓与资金状态 (包含浮动盈亏计算)"""
     try:
         conn = sqlite3.connect('growth_hunter_signals.db')
         df_holdings = pd.read_sql_query("SELECT symbol, shares, cost_basis, sector FROM portfolio_holdings", conn)
@@ -295,7 +293,6 @@ def get_portfolio_state():
         return Config.PORTFOLIO_VALUE, Config.PORTFOLIO_VALUE, {}, {}
 
 def update_portfolio(selected_rows):
-    """更新组合持仓"""
     try:
         conn = sqlite3.connect('growth_hunter_signals.db')
         today = datetime.now().strftime('%Y-%m-%d')
@@ -320,7 +317,6 @@ def update_portfolio(selected_rows):
         logging.error(f"⚠️ 持仓状态更新失败: {e}")
 
 def review_portfolio():
-    """盘前持仓体检与退出逻辑"""
     logging.info("🧐 开始执行盘前持仓体检与动态退出逻辑 (Dynamic Exit Logic)...")
     try:
         conn = sqlite3.connect('growth_hunter_signals.db')
@@ -398,96 +394,12 @@ def review_portfolio():
         logging.error(f"持仓审查发生致命错误: {e}")
         return ""
 
-def run_auto_backtest():
-    """执行带追踪止损的真实回测与因子归因模拟"""
-    try:
-        conn = sqlite3.connect('growth_hunter_signals.db')
-        df_db = pd.read_sql_query("SELECT * FROM signals", conn)
-        if df_db.empty: return ""
-        df_db['date'] = pd.to_datetime(df_db['date'])
-        unique_dates = sorted(df_db['date'].dt.date.unique(), reverse=True)
-        if len(unique_dates) <= 1: return "\n📊 【复盘战报】: 数据积累中。\n"
-        
-        report = "\n📊 【系统真实回测战报 (修正版追踪止损)】\n"
-        tickers_to_fetch = set(df_db['symbol'].tolist())
-        current_data = yf.download(list(tickers_to_fetch), period="2mo", group_by="ticker", progress=False, threads=False)
-        
-        # 1. 总体统计
-        for label, n in {'T+5': 5, 'T+15': 15, 'T+25': 25}.items():
-            valid_dates = [d for d in unique_dates if d <= (pd.to_datetime(unique_dates[0]) - pd.offsets.BDay(n)).date()]
-            if valid_dates:
-                signals = df_db[df_db['date'].dt.date == valid_dates[0]]
-                wins, total, rets = 0, 0, []
-                for _, row in signals.iterrows():
-                    try:
-                        sym = row['symbol']
-                        df_post = current_data[sym][pd.to_datetime(current_data[sym].index).tz_localize(None) >= pd.to_datetime(row['date'])]
-                        if df_post.empty: continue
-                        
-                        cost = row['close_price']
-                        max_high = cost
-                        ret, exit_triggered = 0, False
-                        
-                        for i, (_, day_row) in enumerate(df_post.iterrows()):
-                            if i > n: break 
-                            if day_row['High'] > max_high: max_high = day_row['High']
-                            
-                            if day_row['Low'] <= cost * 0.85:
-                                ret = -0.15
-                                exit_triggered = True; break
-                            elif day_row['Low'] <= max_high * 0.80:
-                                ret = (max_high * 0.80 - cost) / cost
-                                exit_triggered = True; break
-                                
-                        if not exit_triggered:
-                            ret = (df_post['Close'].iloc[min(n, len(df_post)-1)] - cost) / cost
-                            
-                        rets.append(ret)
-                        total += 1
-                        if ret > 0: wins += 1
-                    except: pass
-                if total > 0: report += f" • {label} ({valid_dates[0].strftime('%m-%d')}, {total}只): 胜率 {wins/total:.0%} | 收益 {sum(rets)/total:+.1%}\n"
-        
-        # 2. 因子归因模块
-        report += "\n🔍 【核心因子归因分析 (T+15 胜率统计)】\n"
-        base_n = 15
-        attr_dates = [d for d in unique_dates if d <= (pd.to_datetime(unique_dates[0]) - pd.offsets.BDay(base_n)).date()]
-        if attr_dates:
-            historical_signals = df_db[df_db['date'].dt.date.isin(attr_dates)]
-            for trigger_type in ['枢轴突破', '趋势向上']:
-                group = historical_signals[historical_signals['catalyst'].str.contains(trigger_type, na=False)]
-                group_wins, group_total = 0, 0
-                for _, row in group.iterrows():
-                    try:
-                        sym = row['symbol']
-                        df_post = current_data[sym][pd.to_datetime(current_data[sym].index).tz_localize(None) >= pd.to_datetime(row['date'])]
-                        if len(df_post) < base_n: continue
-                        cost = row['close_price']
-                        max_high = cost
-                        ret, exit_triggered = 0, False
-                        for i, (_, day_row) in enumerate(df_post.iterrows()):
-                            if i > base_n: break
-                            if day_row['High'] > max_high: max_high = day_row['High']
-                            if day_row['Low'] <= cost * 0.85 or day_row['Low'] <= max_high * 0.80:
-                                ret = -0.15 if day_row['Low'] <= cost * 0.85 else (max_high * 0.80 - cost) / cost
-                                exit_triggered = True; break
-                        if not exit_triggered: ret = (df_post['Close'].iloc[base_n] - cost) / cost
-                        group_total += 1
-                        if ret > 0: group_wins += 1
-                    except: pass
-                if group_total > 0:
-                    report += f"  └ 因子 [{trigger_type}] 历史胜率: {group_wins/group_total:.0%} (共 {group_total} 次)\n"
-        return report
-    except Exception: return ""
-
 # ==========================================
 # 模块 B：异动面引擎
 # ==========================================
-def send_notifications(df, sell_report="", backtest_report="", title="🚀 [AI] 起爆预警"):
-    """多通道推送系统"""
+def send_notifications(df, sell_report="", title="🚀 [AI] 起爆预警"):
     summary = f"{title}\n\n"
     if sell_report: summary += sell_report
-    if backtest_report: summary += backtest_report
     
     if df is not None and not df.empty:
         summary += "🔥 **【精选信号】**\n"
@@ -496,7 +408,6 @@ def send_notifications(df, sell_report="", backtest_report="", title="🚀 [AI] 
     elif not sell_report:
         summary += "📭 今日暂无满足条件的信号。"
 
-    # 推送逻辑
     for platform, env_key in [('微信', 'SERVERCHAN_KEY'), ('飞书', 'FEISHU_WEBHOOK'), ('钉钉', 'DINGTALK_WEBHOOK'), ('Telegram', 'TELEGRAM_TOKEN')]:
         val = os.getenv(env_key)
         if not val: continue
@@ -542,7 +453,6 @@ def analyze_options_flow(symbol):
     except Exception: return "获取失败"
 
 def analyze_catalyst(symbol):
-    """【修复】分析新闻催化剂并引入 AI 排雷引擎"""
     try:
         news = yf.Ticker(symbol, session=get_session()).news
         if not news: return "无最新消息"
@@ -569,7 +479,6 @@ def analyze_catalyst(symbol):
                 risk = data.get("red_flag")
                 vc_10x = data.get("vc_10x_potential", False)
                 
-                # 识别致命风险（如财务造假、退市、重大诉讼）
                 if risk and str(risk).lower() != 'null' and str(risk).strip() and risk != '无': 
                     return f"⛔ 致命警报 ({risk})"
                     
@@ -582,7 +491,6 @@ def analyze_catalyst(symbol):
     except Exception: return "获取失败"
 
 def analyze_earnings_calendar(symbol):
-    """分析财报日历，寻找短期催化剂 (5-15天内)"""
     try:
         cal = yf.Ticker(symbol, session=get_session()).calendar
         if cal and 'Earnings Date' in cal:
@@ -610,7 +518,6 @@ def calculate_piotroski_f_score(balance, cashflow, income):
 def get_small_cap_tickers(input_file=None):
     if input_file and os.path.exists(input_file):
         return pd.read_csv(input_file).iloc[:, 0].tolist()
-    # 已将报错退市的 'VLD' 剔除
     return ['LUNR', 'BBAI', 'SOUN', 'GCT', 'STEM', 'IONQ', 'JOBY', 'ACHR', 'HUT', 'CLSK', 'BITF', 'IREN', 'WOLF', 'PLTR', 'HOOD', 'RDDT', 'RIVN', 'ASTS', 'LCID', 'MSTR']
 
 def batch_technical_screen(tickers):
@@ -624,28 +531,36 @@ def batch_technical_screen(tickers):
         try:
             df = data[sym].copy().dropna(subset=['Close'])
             if len(df) < 100: continue
+            
+            # 【修复1】漏斗重构：引入 200 日均线，允许处于横盘洗盘期的神兽进入副轨观察池
             df.ta.supertrend(length=7, multiplier=3.0, append=True)
             df.ta.atr(length=20, append=True)
+            df.ta.sma(length=200, append=True) # 新增 200日均线
+            
             st_dir_col = next(c for c in df.columns if c.startswith('SUPERTd_'))
+            sma200_col = next((c for c in df.columns if c.startswith('SMA_200')), None)
             
             current_close = df['Close'].iloc[-1]
+            sma200_val = df[sma200_col].iloc[-1] if sma200_col and not pd.isna(df[sma200_col].iloc[-1]) else 0
+            
             is_uptrend = df[st_dir_col].iloc[-1] == 1
             is_breakout = current_close > df['High'].shift(1).rolling(25).max().iloc[-1]
+            is_long_term_healthy = current_close > sma200_val if sma200_val > 0 else True # 股价在 200 日均线上方即视为蓄力安全
             
-            if is_uptrend or is_breakout:
+            # 只要满足向上趋势、突破 或者 长期蓄力期，一律放行进入基本面审查
+            if is_uptrend or is_breakout or is_long_term_healthy:
                 passed.append(sym)
                 tech_data[sym] = {
                     'close': float(current_close),
                     'atr': float(df[next(c for c in df.columns if 'ATRr' in c)].iloc[-1]),
                     'tech_score': 1 + (1 if is_breakout else 0),
-                    'triggers': "🎯枢轴突破" if is_breakout else "📈 趋势向上",
+                    'triggers': "🎯枢轴突破" if is_breakout else ("📈 趋势向上" if is_uptrend else "⏳ 均线上方蓄力"),
                     'is_warmup': not is_breakout
                 }
         except Exception: continue
     return passed, tech_data
 
 def analyze_fundamentals(symbol, tech_info, regime, portfolio_state):
-    """第二轮：基本面、相对估值与异动面深度审查"""
     close_price, atr, is_warmup = tech_info['close'], tech_info['atr'], tech_info['is_warmup']
     try:
         ticker = yf.Ticker(symbol, session=get_session())
@@ -656,24 +571,20 @@ def analyze_fundamentals(symbol, tech_info, regime, portfolio_state):
         sector = info.get('sector', 'Unknown')
         rev_growth = info.get('revenueGrowth', 0)
         
-        # 【修复】1. 轧空雷达与机构控盘比例
         short_float = info.get('shortPercentOfFloat', 0)
         inst_hold = info.get('heldPercentInstitutions', 0)
         short_squeeze = f"🚨 高空头 ({short_float:.1%})" if short_float and short_float >= Config.SHORT_FLOAT_MIN else "正常"
         
-        # Rule of 40 修正
         op_margin = info.get('operatingMargins')
         is_r40 = False
         if op_margin is not None:
             is_r40 = (rev_growth + op_margin) * 100 >= 40.0
             
-        # EV/Sales 估值因子：仅奖励低估，不惩罚高估
         ev_to_sales = info.get('enterpriseToRevenue')
         val_score = 0
         if ev_to_sales and ev_to_sales < 5.0:
             val_score += 1
             
-        # R&D 研发投入加分
         rnd_score = 0
         inc_stmt = ticker.income_stmt
         if inc_stmt is not None and not inc_stmt.empty and 'Research And Development' in inc_stmt.index:
@@ -681,7 +592,6 @@ def analyze_fundamentals(symbol, tech_info, regime, portfolio_state):
             if not rnd_data.empty and rnd_data.iloc[0] > 0:
                 rnd_score += 1
             
-        # 同比 (YoY) 营收加速计算 + 【修复】2. 毛利率连续扩张
         q_inc = ticker.quarterly_income_stmt
         rev_accel = False
         gross_margin_exp = False
@@ -697,7 +607,6 @@ def analyze_fundamentals(symbol, tech_info, regime, portfolio_state):
                         if yoy_recent > yoy_prev and yoy_recent > 0.15:
                             rev_accel = True
                             
-                # 毛利率扩张 (最近3季度连续上升)
                 if 'Gross Profit' in q_inc_sorted.index and 'Total Revenue' in q_inc_sorted.index:
                     gps = q_inc_sorted.loc['Gross Profit'].dropna().values
                     revs_gm = q_inc_sorted.loc['Total Revenue'].dropna().values
@@ -711,31 +620,30 @@ def analyze_fundamentals(symbol, tech_info, regime, portfolio_state):
             
         f_score = calculate_piotroski_f_score(ticker.balance_sheet, ticker.cashflow, ticker.income_stmt)
         
-        # 异动面聚合
+        # 【修复2】熔断前置：将基本面审查移到异动面探测之前。不符合资格的直接 return None，省去后续昂贵的 AI 和 Reddit 接口调用
+        is_hyper = rev_growth >= Config.HYPER_GROWTH_THRESHOLD
+        tech_score = tech_info['tech_score']
+        
+        if not ((is_hyper or is_r40) and (tech_score >= 3)):
+            if rev_growth < Config.REVENUE_GROWTH_MIN or f_score < Config.F_SCORE_MIN: return None
+        
+        # --- 存活下来的基本面精英，才配享受异动面（AI/Reddit/期权）的深度扫描 ---
         options = analyze_options_flow(symbol)
         catalyst = analyze_catalyst(symbol)
         
-        # 【拦截】如果 AI 检测到退市/造假等致命风险，直接剔除
-        if '⛔' in catalyst: return None
+        if '⛔' in catalyst: return None # 致命风险一票否决
         
         insider = analyze_insider_trading(symbol)
         reddit_score, reddit_signal = analyze_social_sentiment(symbol)
         earn_score, earn_signal = analyze_earnings_calendar(symbol) 
         
-        # 终极豁免权
-        is_hyper = rev_growth >= Config.HYPER_GROWTH_THRESHOLD
-        if not ((is_hyper or is_r40) and (tech_info['tech_score'] >= 3 or reddit_score >= 1)):
-            if rev_growth < Config.REVENUE_GROWTH_MIN or f_score < Config.F_SCORE_MIN: return None
-        
-        # 分数叠加并纳入新增的轧空与毛利因子
-        comp_score = tech_info['tech_score'] + reddit_score + earn_score + val_score + rnd_score
+        comp_score = tech_score + reddit_score + earn_score + val_score + rnd_score
         comp_score += (1 if '🔥' in options else 0) 
         comp_score += (1 if rev_accel else 0)
         comp_score += (1 if gross_margin_exp else 0)
         comp_score += (1 if short_float and short_float >= Config.SHORT_FLOAT_MIN else 0)
         comp_score += (1 if inst_hold and inst_hold > 0.30 else 0)
         
-        # 金字塔资金调度与止损基线
         shares, action_tag = 0, "🔭 观察等待点火"
         if not is_warmup:
             if portfolio_state['sector_exposure'].get(sector, 0.0) >= portfolio_state['total_equity'] * Config.MAX_SECTOR_WEIGHT:
@@ -811,8 +719,7 @@ def main(dry_run=False, test_mode=False, input_file=None):
             actionable_df = df[df['建议股数'] > 0]
             save_signals_to_db(actionable_df, len(tickers), len(passed_tech))
             update_portfolio(actionable_df)
-            backtest_report = run_auto_backtest()
-            send_notifications(df, sell_report, backtest_report)
+            send_notifications(df, sell_report)
         
         # 生成报告文件
         df.to_csv('growth_hunter_results.csv', index=False)
