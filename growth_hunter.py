@@ -3,7 +3,7 @@
 新增能力：Reddit 另类数据捕捉 (r/wallstreetbets) + 散户狂热指数
 进阶能力：全生命周期资金闭环 (动态止盈止损 + 资金复利滚动)
 行情适配：维基百科稳定股票池 + 极强动能免检特权，破除好行情踏空盲区
-深度打磨：引入动态ATR、消除回测前视偏差、强制UA轮换、并发数据源
+深度打磨：引入 Rule of 40、合并情绪因子降噪、动态ATR、消除回测前视偏差
 """
 
 import yfinance as yf
@@ -484,7 +484,6 @@ def get_small_cap_tickers(input_file=None):
 
     tickers = set()
     
-    # 并发抓取维基百科与 Russell，防止单点阻塞
     def fetch_wiki(url):
         try:
             r = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
@@ -704,17 +703,26 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             revenue_growth = info.get('revenueGrowth')
             gross_margin = info.get('grossMargins')
             
+            # 【策略修正 1】：引入 Rule of 40 (40法则)
+            op_margin = info.get('operatingMargins')
+            if op_margin is None: 
+                op_margin = (gross_margin - 0.20) if gross_margin else 0.0
+                
+            rule_of_40 = ((revenue_growth or 0) + op_margin) * 100
+            is_rule_of_40_pass = rule_of_40 >= 40.0
+            
             tech_score = tech_info.get('tech_score', 0)
             is_hyper_growth = revenue_growth is not None and revenue_growth >= Config.HYPER_GROWTH_THRESHOLD
             
-            # 【策略修正】：动能特权不再完全豁免营收，保底必须 >= 0 (防止熊市买入垃圾股)
+            # 【策略修正 2】：即使动能极强，也拒绝营收负增长的纯垃圾股
             has_momentum_privilege = (tech_score >= 3)
             
-            req_growth = 0.0 if (is_hyper_growth or has_momentum_privilege) else Config.REVENUE_GROWTH_MIN
-            req_margin = 0.05 if (is_hyper_growth or has_momentum_privilege) else 0.20
-            req_f_score = 2 if (is_hyper_growth or has_momentum_privilege) else Config.F_SCORE_MIN
+            # 如果满足 Rule of 40、极速扩张或动能特权，F-Score 门槛降为 0
+            is_growth_exempt = is_hyper_growth or has_momentum_privilege or is_rule_of_40_pass
+            req_growth = 0.0 if is_growth_exempt else Config.REVENUE_GROWTH_MIN
+            req_margin = 0.05 if is_growth_exempt else 0.20
+            req_f_score = 0 if is_growth_exempt else Config.F_SCORE_MIN
             
-            # 容忍 Yahoo API 数据缺失引起的误杀，但若明确为负则剔除
             if revenue_growth is None and has_momentum_privilege: revenue_growth = req_growth
             if gross_margin is None and has_momentum_privilege: gross_margin = req_margin
             
@@ -744,12 +752,11 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             if revenue_growth is None or revenue_growth < req_growth: return None
             if gross_margin is None or gross_margin < req_margin: return None
             
-            # 【数据补算标记】
-            data_tag = "[特权豁免/数据缺失补算]" if has_momentum_privilege else ""
+            data_tag = "[数据豁免/补算]" if has_momentum_privilege else ""
             
             f_score = calculate_piotroski_f_score(bs, cf, inc)
             if not isinstance(f_score, int):
-                if has_momentum_privilege: 
+                if is_growth_exempt: 
                     f_score = req_f_score
                 else:
                     return None
@@ -775,13 +782,21 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
                 if short_float >= Config.SHORT_FLOAT_MIN: squeeze_signal = f"🩸 世纪轧空 ({short_float:.1%})"
                 elif short_float >= 0.10: squeeze_signal = f"⚠️ 高度做空 ({short_float:.1%})"
 
-            comp_score = (f_score - req_f_score) if isinstance(f_score, int) else 0
+            # 【策略修正 3】：因子降噪与归一化
+            comp_score = 0
+            if f_score >= req_f_score and not is_growth_exempt:
+                comp_score += (f_score - req_f_score)  # 给价值型提供加分
+                
             comp_score += tech_score
-            comp_score += reddit_score 
             
-            if is_hyper_growth or has_momentum_privilege: comp_score += 3  
+            if is_rule_of_40_pass: comp_score += 2
+            if is_hyper_growth or has_momentum_privilege: comp_score += 1
             if '🦄' in catalyst: comp_score += 4  
-            if '🔥' in options_flow: comp_score += 2
+            
+            # 合并 Reddit 与期权异动为“市场情绪因子”，取最大值而非叠加防共线性膨胀
+            options_bonus = 2 if '🔥' in options_flow else (1 if '⚠️' in options_flow else 0)
+            hype_factor = max(reddit_score, options_bonus)
+            comp_score += hype_factor
             
             if '🚀' in catalyst: comp_score += 1
             try:
@@ -795,7 +810,7 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             if '🩸' in squeeze_signal: comp_score += 2
             elif '⚠️' in squeeze_signal: comp_score += 1
 
-            # 【风控修正】：考虑高波动股的动态 ATR 乘数
+            # 【策略修正 4】：动态 ATR 乘数，防高波动小盘股洗盘误杀
             atr_pct = atr / close_price if close_price > 0 else 0
             base_atr_mult = 2.0 if atr_pct > 0.05 else Config.ATR_MULTIPLIER
             actual_atr_mult = (base_atr_mult * 0.7) if regime == 'YELLOW' else base_atr_mult
@@ -820,7 +835,7 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
                 '催化剂': catalyst, '散户情绪': reddit_signal, '内幕交易': insider_trading, '轧空雷达': squeeze_signal,
                 '最新收盘价': round(close_price, 2), '止损价': round(stop_loss, 2),
                 '建议股数': raw_shares, 'F_Score_raw': f_score, 'gross_margin': gross_margin,
-                'revenue_growth_raw': revenue_growth, 'data_tag': data_tag
+                'revenue_growth_raw': revenue_growth, 'data_tag': data_tag, 'rule_of_40': rule_of_40
             }
         except Exception:
             if hasattr(thread_local, "session"):
@@ -854,7 +869,6 @@ def run_auto_backtest():
                     
         if not tickers_to_fetch: return ""
         
-        # 获取近1个月历史数据检查止损触发
         current_data = yf.download(list(tickers_to_fetch), period="1mo", group_by="ticker", threads=True)
         
         for label, signals in backtest_tasks.items():
@@ -865,7 +879,6 @@ def run_auto_backtest():
                     df_sym = current_data[sym].dropna() if isinstance(current_data.columns, pd.MultiIndex) else current_data.dropna()
                     if df_sym.empty: continue
                     
-                    # 获取推票以来的价格走势
                     signal_date = pd.to_datetime(row['date']).tz_localize(None)
                     df_post = df_sym[df_sym.index.tz_localize(None) >= signal_date]
                     if df_post.empty: continue
@@ -873,12 +886,11 @@ def run_auto_backtest():
                     cost_price = row['close_price']
                     if cost_price <= 0: continue
                     
-                    # 检查是否触底硬止损 (跌幅 15%)
                     min_low = df_post['Low'].min()
                     current_close = float(df_post['Close'].iloc[-1])
                     
                     if min_low <= cost_price * 0.85:
-                        ret = -0.15 # 记为触及止损出局
+                        ret = -0.15 
                     else:
                         ret = (current_close - cost_price) / cost_price
                         
@@ -964,7 +976,6 @@ def main(dry_run=False, input_file=None):
         results = []
         logging.info(f"⏳ 第二阶段：深挖 {len(passed_tech_tickers)} 只新标的财务、期权、散户情绪与风投叙事...")
         
-        # 将 IO_Executor 控制在 main 内部，防止多次调用资源泄漏
         with ThreadPoolExecutor(max_workers=Config.IO_WORKERS) as io_exec:
             with ThreadPoolExecutor(max_workers=Config.THREAD_WORKERS) as executor:
                 futures = {executor.submit(analyze_fundamentals, sym, tech_data_dict.get(sym, {'close': 0.0, 'atr': 0.0, 'tech_score': 0}), regime, io_exec): sym for sym in passed_tech_tickers}
@@ -1000,7 +1011,7 @@ def main(dry_run=False, input_file=None):
                 row['建议股数'] = 0 
                 
             reasons = (
-                f"F-Score: {row['F_Score_raw']}/9 | 增速: {row['revenue_growth_raw']:.1%} | 毛利: {row['gross_margin']:.1%}\n"
+                f"R40法则: {row['rule_of_40']:.1f}% | 增速: {row['revenue_growth_raw']:.1%} | F-Score: {row['F_Score_raw']}/9\n"
                 f"  └ 🛡️ 风控: 建议买入 {shares_str} | 破位止损 ${row['止损价']:.2f} | 预估动用 ${cost:.2f}\n"
                 f"  └ 🎲 另类: {row['期权异动']} | {row['散户情绪']}\n"
                 f"  └ 📰 消息: {row['催化剂']}\n"
@@ -1011,7 +1022,7 @@ def main(dry_run=False, input_file=None):
             final_selected.append(row)
             
         df = pd.DataFrame(final_selected)
-        df = df.drop(columns=['止损价', '建议股数', 'F_Score_raw', 'gross_margin', 'revenue_growth_raw'], errors='ignore')
+        df = df.drop(columns=['止损价', '建议股数', 'F_Score_raw', 'gross_margin', 'revenue_growth_raw', 'rule_of_40'], errors='ignore')
 
         md_df = df.copy()
         md_df['股票代码'] = md_df['股票代码'].apply(lambda x: f"[{x}](https://finance.yahoo.com/quote/{x})")
