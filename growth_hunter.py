@@ -2,6 +2,7 @@
 🚀 GrowthHunter V10.0 - 终极量化引擎 (Alternative Data Edition)
 新增能力：Reddit 另类数据捕捉 (r/wallstreetbets) + 散户狂热指数
 进阶能力：全生命周期资金闭环 (动态止盈止损 + 资金复利滚动)
+行情适配：维基百科稳定股票池 + 极强动能免检特权，破除好行情踏空盲区
 """
 
 import yfinance as yf
@@ -484,16 +485,33 @@ def get_small_cap_tickers(input_file=None):
         try: return pd.read_csv(cache_path)['Symbol'].tolist()
         except Exception: pass
 
+    tickers = []
+    
+    # 【股票池优化】：新增抓取维基百科 S&P 600 和 S&P 400，从不封IP，保底1000+标的
+    try:
+        sp600 = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_600_companies')[0]['Symbol'].tolist()
+        sp400 = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_400_companies')[0]['Symbol'].tolist()
+        tickers.extend(sp600 + sp400)
+    except Exception: pass
+
+    # 尝试 Russell 2000
     for url in ['https://stockanalysis.com/list/russell-2000/', 'https://www.marketbeat.com/russell-2000/']:
         try:
             response = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
             response.raise_for_status()
-            tickers = pd.read_html(response.text)[0]['Symbol'].tolist()
-            pd.DataFrame(tickers, columns=['Symbol']).to_csv(cache_path, index=False)
-            logging.info(f"✅ 加载 Russell 2000 共 {len(tickers)} 只")
-            return tickers
+            rs_tickers = pd.read_html(response.text)[0]['Symbol'].tolist()
+            tickers.extend(rs_tickers)
         except Exception: continue
-    return ['LUNR', 'BBAI', 'SOUN', 'GCT', 'VLD', 'STEM', 'IONQ', 'JOBY', 'ACHR', 'HUT', 'CLSK', 'BITF', 'IREN', 'WOLF']
+        
+    if tickers:
+        # 去重并修复 BRK.B 格式问题
+        tickers = list(set([str(t).replace('.', '-') for t in tickers]))
+        pd.DataFrame(tickers, columns=['Symbol']).to_csv(cache_path, index=False)
+        logging.info(f"✅ 成功从网络抓取股票池，共 {len(tickers)} 只")
+        return tickers
+
+    logging.error("❌ 所有网络股票池获取失败，启动扩容版保底防线...")
+    return ['LUNR', 'BBAI', 'SOUN', 'GCT', 'VLD', 'STEM', 'IONQ', 'JOBY', 'ACHR', 'HUT', 'CLSK', 'BITF', 'IREN', 'WOLF', 'PLTR', 'HOOD', 'RDDT', 'RIVN', 'ASTS', 'LCID', 'MSTR']
 
 def check_unfilled_gap(df, lookback=10):
     if len(df) < lookback + 2: return False
@@ -690,13 +708,22 @@ def analyze_fundamentals(symbol, tech_info=None, regime='GREEN'):
             revenue_growth = info.get('revenueGrowth')
             gross_margin = info.get('grossMargins')
             
+            tech_score = tech_info.get('tech_score', 0)
             is_hyper_growth = revenue_growth is not None and revenue_growth >= Config.HYPER_GROWTH_THRESHOLD
-            req_growth = 0.0 if is_hyper_growth else Config.REVENUE_GROWTH_MIN
-            req_margin = 0.05 if is_hyper_growth else 0.20
-            req_f_score = 2 if is_hyper_growth else Config.F_SCORE_MIN
             
-            if revenue_growth is not None and revenue_growth < req_growth: return None
-            if gross_margin is not None and gross_margin < req_margin: return None
+            # 【行情兜底特权】：对量价技术面极度强势的票 (Tech Score >= 3) 给予基本面盲区豁免
+            has_momentum_privilege = (tech_score >= 3)
+            
+            req_growth = 0.0 if (is_hyper_growth or has_momentum_privilege) else Config.REVENUE_GROWTH_MIN
+            req_margin = 0.05 if (is_hyper_growth or has_momentum_privilege) else 0.20
+            req_f_score = 2 if (is_hyper_growth or has_momentum_privilege) else Config.F_SCORE_MIN
+            
+            # 容忍 Yahoo API 数据缺失引起的误杀
+            if revenue_growth is None and has_momentum_privilege: revenue_growth = req_growth
+            if gross_margin is None and has_momentum_privilege: gross_margin = req_margin
+            
+            if revenue_growth is None or revenue_growth < req_growth: return None
+            if gross_margin is None or gross_margin < req_margin: return None
 
             inc, bs, cf = ticker.income_stmt, ticker.balance_sheet, ticker.cashflow
             
@@ -722,7 +749,13 @@ def analyze_fundamentals(symbol, tech_info=None, regime='GREEN'):
             if gross_margin is None or gross_margin < req_margin: return None
             
             f_score = calculate_piotroski_f_score(bs, cf, inc)
-            if not isinstance(f_score, int) or f_score < req_f_score: return None
+            if not isinstance(f_score, int):
+                if has_momentum_privilege: 
+                    f_score = req_f_score
+                else:
+                    return None
+            elif f_score < req_f_score: 
+                return None
 
             options_flow = analyze_options_flow(symbol)
             catalyst = analyze_catalyst(symbol)
@@ -744,10 +777,10 @@ def analyze_fundamentals(symbol, tech_info=None, regime='GREEN'):
                 elif short_float >= 0.10: squeeze_signal = f"⚠️ 高度做空 ({short_float:.1%})"
 
             comp_score = (f_score - req_f_score) if isinstance(f_score, int) else 0
-            comp_score += tech_info.get('tech_score', 0)
-            comp_score += reddit_score # 【V10.0】散户狂热分数计入总分
+            comp_score += tech_score
+            comp_score += reddit_score 
             
-            if is_hyper_growth: comp_score += 3  
+            if is_hyper_growth or has_momentum_privilege: comp_score += 3  
             if '🦄' in catalyst: comp_score += 4  
             if '🔥' in options_flow: comp_score += 2
             
