@@ -1,6 +1,6 @@
 """
 🚀 GrowthHunter V9.0 - 10倍股猎手 (全栈终极版)
-策略进化：AI大模型 JSON 深度研报 + 致命排雷 + 期权异动 + 🩸 世纪轧空 + 大盘熔断 + ATR 动态仓位风控
+策略进化：AI大模型 JSON 深度研报 + 致命排雷 + 期权异动 + 🩸 世纪轧空 + 大盘熔断 + ATR 动态组合资金风控
 """
 
 import yfinance as yf
@@ -42,19 +42,19 @@ logging.basicConfig(
 
 class Config:
     MARKET_CAP_MIN = 5e7
-    MARKET_CAP_MAX = 2e9
+    MARKET_CAP_MAX = 3e9       # 适度放宽小盘股定义上限
     REVENUE_GROWTH_MIN = 0.20
     F_SCORE_MIN = 5
     SHORT_FLOAT_MIN = 0.20  
-    SLEEP_MIN = 0.2
-    SLEEP_MAX = 1.0
-    CACHE_DAYS = 30         
+    SLEEP_MIN = 0.3
+    SLEEP_MAX = 1.2
+    CACHE_DAYS = 7             # 缩短缓存，保持数据新鲜
     INSIDER_DAYS = 30       
     THREAD_WORKERS = 4      
     IO_WORKERS = 20         
     BENCHMARK_TICKER = 'IWM' 
     
-    # 【V8.1 核心：风控与资金管理】
+    # 风控与资金管理
     PORTFOLIO_VALUE = 100000 # 实盘/模拟总资金 ($100k)
     RISK_PER_TRADE = 0.01    # 单笔最大容忍亏损 (总资金的 1%)
     ATR_MULTIPLIER = 1.5     # 动态止损线 (1.5 倍 ATR 缓冲)
@@ -80,27 +80,43 @@ def get_session():
 # 模块 D：大盘政权与熔断体系
 # ==========================================
 def check_macro_regime():
-    """大盘政权校验，防止在股灾中接飞刀"""
+    """大盘政权校验，多维防守（红绿黄三级政权）"""
     logging.info("🌍 启动风控系统：扫描宏观大盘政权 (Macro Regime)...")
     try:
-        spy = yf.download("SPY", period="1y", show_errors=False, progress=False)
-        if spy.empty: 
-            return True, "无法获取大盘数据，默认放行"
+        # 获取三大宏观风控标的
+        macro_data = yf.download(["SPY", "IWM", "^VIX"], period="1y", group_by="ticker", show_errors=False, progress=False)
+        if macro_data.empty: 
+            return 'GREEN', "无法获取大盘数据，默认放行"
             
-        spy['MA200'] = spy['Close'].rolling(200).mean()
-        last_close = float(spy['Close'].iloc[-1])
-        last_ma200 = float(spy['MA200'].iloc[-1])
+        last_vix = float(macro_data['^VIX']['Close'].iloc[-1]) if '^VIX' in macro_data.columns.levels[0] else 20.0
         
-        if pd.isna(last_ma200):
-            return True, "均线数据不足，默认放行"
-        if last_close < last_ma200:
-            return False, f"SPY ({last_close:.2f}) < 200MA ({last_ma200:.2f})，熊市防御"
+        iwm_close = macro_data['IWM']['Close']
+        iwm_ma20 = float(iwm_close.rolling(20).mean().iloc[-1])
+        iwm_ma50 = float(iwm_close.rolling(50).mean().iloc[-1])
+        last_iwm = float(iwm_close.iloc[-1])
+        
+        spy_close = macro_data['SPY']['Close']
+        last_spy = float(spy_close.iloc[-1])
+        spy_ma200 = float(spy_close.rolling(200).mean().iloc[-1])
+        
+        # 🔴 红灯：极端恐慌或绝对熊市，彻底熔断
+        if last_vix > 25.0:
+            return 'RED', f"VIX ({last_vix:.2f}) > 25，市场恐慌蔓延，触发红灯熔断"
+        if last_spy < spy_ma200:
+            return 'RED', f"SPY ({last_spy:.2f}) < 200MA ({spy_ma200:.2f})，熊市防御，触发红灯熔断"
             
-        logging.info(f"✅ 大盘环境安全 (SPY: {last_close:.2f} > 200MA: {last_ma200:.2f})")
-        return True, f"SPY ({last_close:.2f}) > 200MA，趋势健康"
+        # 🟡 黄灯：震荡走弱或潜在警戒，半仓防守
+        if pd.notna(iwm_ma50) and (iwm_ma20 < iwm_ma50 or last_iwm < iwm_ma50):
+            return 'YELLOW', f"小盘股趋势走坏 (IWM 20MA < 50MA 或价格跌破 50MA)，触发黄灯 (止损收紧，仓位减半)"
+        if last_vix > 20.0:
+            return 'YELLOW', f"VIX ({last_vix:.2f}) > 20，市场波动加剧，触发黄灯 (止损收紧，仓位减半)"
+
+        # 🟢 绿灯：全面进攻
+        logging.info(f"✅ 大盘环境安全 (VIX: {last_vix:.1f}, IWM 强势, SPY > 200MA)")
+        return 'GREEN', "宏观环境健康，绿灯亮起，全面进攻"
     except Exception as e:
         logging.debug(f"大盘校验异常: {e}")
-        return True, f"大盘校验异常，默认放行"
+        return 'GREEN', "大盘校验异常，默认放行"
 
 # ==========================================
 # 模块 C：SQLite 本地信号归档数据库
@@ -128,6 +144,14 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_date ON signals (date)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_symbol ON signals (symbol)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_daily_stats_date ON daily_stats (date)')
+    
+    # 【Batch 2：创建真实的持仓记忆表】
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS portfolio_holdings (
+            symbol TEXT PRIMARY KEY, shares INTEGER,
+            cost_basis REAL, purchase_date TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -164,6 +188,41 @@ def save_signals_to_db(df, tickers_scanned_count, passed_tech_count):
         logging.info("💾 信号与运行统计已成功归档至本地 SQLite 数据库")
     except Exception as e:
         logging.error(f"⚠️ 数据库保存失败: {e}")
+
+# 【Batch 2：读取与更新组合真实持仓资金】
+def get_remaining_cash():
+    try:
+        conn = sqlite3.connect('growth_hunter_signals.db')
+        df = pd.read_sql_query("SELECT shares, cost_basis FROM portfolio_holdings", conn)
+        conn.close()
+        if df.empty: return Config.PORTFOLIO_VALUE
+        invested = (df['shares'] * df['cost_basis']).sum()
+        return max(0, Config.PORTFOLIO_VALUE - invested)
+    except Exception:
+        return Config.PORTFOLIO_VALUE
+
+def update_portfolio(selected_rows):
+    try:
+        conn = sqlite3.connect('growth_hunter_signals.db')
+        today = datetime.now().strftime('%Y-%m-%d')
+        updated_count = 0
+        for row in selected_rows:
+            shares = row.get('建议股数', 0)
+            if isinstance(shares, int) and shares > 0:
+                conn.execute('''
+                    INSERT INTO portfolio_holdings (symbol, shares, cost_basis, purchase_date)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        cost_basis = ((cost_basis * shares) + (excluded.cost_basis * excluded.shares)) / (shares + excluded.shares),
+                        shares = shares + excluded.shares,
+                        purchase_date = excluded.purchase_date
+                ''', (row['股票代码'], shares, row['最新收盘价'], today))
+                updated_count += 1
+        conn.commit()
+        conn.close()
+        if updated_count > 0: logging.info(f"💼 组合持仓状态已同步，共 {updated_count} 只标的已入账。")
+    except Exception as e:
+        logging.error(f"⚠️ 持仓状态更新失败: {e}")
 
 # ==========================================
 # 模块 B：期权异动、新闻催化与内幕交易
@@ -217,7 +276,7 @@ def analyze_options_flow(symbol):
     except Exception: return "获取失败"
 
 def analyze_catalyst(symbol):
-    """【V9.0 升级】：大模型 JSON 结构化提取，多维打标与致命排雷"""
+    """大模型 JSON 结构化提取，多维打标、致命排雷与指数退避重试兜底"""
     try:
         news = shared_io_executor.submit(lambda: yf.Ticker(symbol, session=get_session()).news).result(timeout=5)
         if not news: return "无最新消息"
@@ -227,11 +286,12 @@ def analyze_catalyst(symbol):
 
         api_key = os.getenv("GEMINI_API_KEY")
         if api_key and HAS_GENAI:
-            try:
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel('gemini-1.5-flash')
-                news_text = "\n".join([f"- {n.get('title', '')}: {n.get('summary', '')}" for n in news[:5]])
-                prompt = f"""作为资深量化风控官与分析师，阅读股票 {symbol} 的近期新闻：
+            for attempt in range(3):  # AI 重试与指数退避兜底机制
+                try:
+                    genai.configure(api_key=api_key)
+                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    news_text = "\n".join([f"- {n.get('title', '')}: {n.get('summary', '')}" for n in news[:5]])
+                    prompt = f"""作为资深量化风控官与分析师，阅读股票 {symbol} 的近期新闻：
 {news_text}
 
 任务：提取关键信息，必须且只能输出一个合法的 JSON 字符串，不要任何 Markdown 标记。格式如下：
@@ -241,28 +301,32 @@ def analyze_catalyst(symbol):
   "red_flag": "发现的具体致命风险(如增发/诉讼/退市等)，若无请严格填 null",
   "summary": "限15个汉字的核心逻辑总结"
 }}"""
-                res_text = model.generate_content(prompt).text.strip()
-                
-                # 修复截断问题：使用字符串乘法生成反引号，避免破坏外部 Markdown 解析
-                bt = '`' * 3
-                if res_text.startswith(bt):
-                    res_text = re.sub(rf'^{bt}(?:json)?\n?|{bt}$', '', res_text).strip()
-                
-                data = json.loads(res_text)
-                score = data.get("sentiment_score", 50)
-                event = data.get("event_type", "其他")
-                risk = data.get("red_flag")
-                summary = data.get("summary", "")
-                
-                # 致命风险排雷防线
-                if risk and str(risk).lower() != 'null' and str(risk).strip() and risk != '无':
-                    return f"⛔ 致命警报 (风险: {risk})"
+                    res_text = model.generate_content(prompt).text.strip()
                     
-                # 多维标签打标输出
-                emoji = "🚀" if score >= 60 else "⚠️" if score <= 40 else "⚖️"
-                return f"{emoji} 情绪{score} [{event}] {summary}"
-            except Exception as e: 
-                logging.debug(f"AI JSON解析失败 ({e})，降级字典模式")
+                    # 修复截断问题：清除 Markdown JSON 标记
+                    bt = '`' * 3
+                    if res_text.startswith(bt):
+                        res_text = re.sub(rf'^{bt}(?:json)?\n?|{bt}$', '', res_text).strip()
+                    
+                    data = json.loads(res_text)
+                    score = data.get("sentiment_score", 50)
+                    event = data.get("event_type", "其他")
+                    risk = data.get("red_flag")
+                    summary = data.get("summary", "")
+                    
+                    # 致命风险排雷防线
+                    if risk and str(risk).lower() != 'null' and str(risk).strip() and risk != '无':
+                        return f"⛔ 致命警报 (风险: {risk})"
+                        
+                    # 多维标签打标输出
+                    emoji = "🚀" if score >= 60 else "⚠️" if score <= 40 else "⚖️"
+                    return f"{emoji} 情绪{score} [{event}] {summary}"
+                except Exception as e: 
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)  # 发生异常时退避 1s, 2s
+                        continue
+                    logging.debug(f"AI JSON解析最终失败 ({e})，降级字典模式")
+                    break
         
         # 平滑降级：V8 字典模式
         pos_words = ['beat', 'surge', 'upgrade', 'fda', 'acquire', 'buy', 'profit', 'record', 'breakout', 'partner', 'approval']
@@ -303,7 +367,7 @@ def get_small_cap_tickers(input_file=None):
         try: return pd.read_csv(cache_path)['Symbol'].tolist()
         except Exception: pass
 
-    for url in ['[https://stockanalysis.com/list/russell-2000/](https://stockanalysis.com/list/russell-2000/)', '[https://www.marketbeat.com/russell-2000/](https://www.marketbeat.com/russell-2000/)']:
+    for url in ['https://stockanalysis.com/list/russell-2000/', 'https://www.marketbeat.com/russell-2000/']:
         try:
             response = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
             response.raise_for_status()
@@ -364,7 +428,16 @@ def batch_technical_screen(tickers):
     
     for sym in tqdm(tickers, desc="🎯 技术面筛选", disable=is_github_actions):
         try:
-            df = data[sym].copy() if isinstance(data.columns, pd.MultiIndex) else data.copy()
+            # 【兜底优化 1：防范 MultiIndex 下部分退市股票引发 KeyError 崩溃】
+            if isinstance(data.columns, pd.MultiIndex):
+                if sym not in data.columns.levels[0] and sym not in data.columns.levels[1]:
+                    continue
+                df = data[sym].copy()
+            else:
+                if len(download_list) > 1 and sym not in data.columns:
+                    continue
+                df = data.copy()
+                
             df = df.dropna(subset=['Close', 'Volume'])
             if len(df) < 150: continue
             if getattr(df.index, 'tz', None) is not None: df.index = df.index.tz_localize(None)
@@ -403,14 +476,21 @@ def batch_technical_screen(tickers):
 
             has_unfilled_gap = check_unfilled_gap(df, lookback=10)
             
-            if (df[st_dir_col].iloc[idx] == 1 and 
-                current_vol > max(vol_ma20.iloc[idx] * 1.5, vol_95th.iloc[idx] * 0.8) and 
-                rs_condition and 
-                (is_squeeze_break or has_unfilled_gap) and 
-                df[cmf_col].iloc[idx] > 0):
+            # 【技术筛网降本增效，从硬性过滤改为弹性打分】
+            is_uptrend = (df[st_dir_col].iloc[idx] == 1)
+            if not is_uptrend:
+                continue  # 核心底线：必须处于 SuperTrend 多头
                 
+            tech_score = 0
+            if current_vol > max(vol_ma20.iloc[idx] * 1.5, vol_95th.iloc[idx] * 0.8): tech_score += 1
+            if rs_condition: tech_score += 1
+            if is_squeeze_break or has_unfilled_gap: tech_score += 1
+            if df[cmf_col].iloc[idx] > 0: tech_score += 1
+            
+            # 满分 4 分，得 2 分及以上即可过关（兼容震荡市与单边市）
+            if tech_score >= 2:
                 passed_tickers.append(sym)
-                tech_data[sym] = {'close': float(current_close), 'atr': float(df[atr_col].iloc[idx])}
+                tech_data[sym] = {'close': float(current_close), 'atr': float(df[atr_col].iloc[idx]), 'tech_score': tech_score}
         except Exception: continue
             
     logging.info(f"🎯 阶段一完成：技术面保留 {len(passed_tickers)} 只标的")
@@ -483,8 +563,8 @@ def calculate_piotroski_f_score(bs, cf, inc):
         return f_score
     except Exception: return "N/A"
 
-def analyze_fundamentals(symbol, tech_info=None):
-    if tech_info is None: tech_info = {'close': 0.0, 'atr': 0.0}
+def analyze_fundamentals(symbol, tech_info=None, regime='GREEN'):
+    if tech_info is None: tech_info = {'close': 0.0, 'atr': 0.0, 'tech_score': 0}
     close_price = tech_info.get('close', 0.0)
     atr = tech_info.get('atr', 0.0)
     
@@ -492,16 +572,36 @@ def analyze_fundamentals(symbol, tech_info=None):
     for attempt in range(2):
         try:
             ticker = yf.Ticker(symbol, session=get_session())
-            info = ticker.info
+            
+            # 【深水区优化 1：使用 fast_info 极速拦截市值，大幅减少 info 封禁】
+            try:
+                market_cap = float(ticker.fast_info.market_cap)
+            except Exception:
+                market_cap = 0
+                
+            if not market_cap or not (Config.MARKET_CAP_MIN < market_cap < Config.MARKET_CAP_MAX): 
+                return None
+
+            # 带有退避重试的详细 info 获取
+            info = {}
+            for _ in range(2):
+                try:
+                    info = ticker.info
+                    if info: break
+                except Exception:
+                    time.sleep(random.uniform(1.0, 2.5))
+                    
             if not info or 'longName' not in info: return None
 
-            market_cap = info.get('marketCap', 0)
-            if not (Config.MARKET_CAP_MIN < market_cap < Config.MARKET_CAP_MAX): return None
-
-            inc, bs, cf = ticker.income_stmt, ticker.balance_sheet, ticker.cashflow
-            
             revenue_growth = info.get('revenueGrowth')
             gross_margin = info.get('grossMargins')
+            
+            # 若 info 中已存在营收与毛利数据且不达标，立即熔断，节省API开销
+            if revenue_growth is not None and revenue_growth < Config.REVENUE_GROWTH_MIN: return None
+            if gross_margin is not None and gross_margin < 0.20: return None
+
+            # 确信有潜力，才下载沉重的数据表
+            inc, bs, cf = ticker.income_stmt, ticker.balance_sheet, ticker.cashflow
             
             # 财报数据回退计算逻辑
             if (revenue_growth is None or gross_margin is None) and not inc.empty:
@@ -538,7 +638,7 @@ def analyze_fundamentals(symbol, tech_info=None):
             catalyst = analyze_catalyst(symbol)
             insider_trading = analyze_insider_trading(symbol)
             
-            # 【V9.0 终极防线】：致命风险单票拦截熔断
+            # 致命风险单票拦截熔断
             if '⛔ 致命警报' in catalyst: 
                 logging.info(f"🚫 触发单票熔断: [{symbol}] {catalyst}")
                 return None
@@ -554,9 +654,11 @@ def analyze_fundamentals(symbol, tech_info=None):
                 elif short_float >= 0.10: squeeze_signal = f"⚠️ 高度做空 ({short_float:.1%})"
 
             comp_score = (f_score - Config.F_SCORE_MIN) if isinstance(f_score, int) else 0
+            comp_score += tech_info.get('tech_score', 0)  # 技术面弹性得分计入综合总分
+            
             if '🔥' in options_flow: comp_score += 2
             
-            # 【V9.0 安全提取分数】：融合 AI 情绪分数分配动态权重
+            # AI 情绪分数分配动态权重
             if '🚀' in catalyst: comp_score += 1
             try:
                 if '情绪' in catalyst:
@@ -569,33 +671,31 @@ def analyze_fundamentals(symbol, tech_info=None):
             if '🩸' in squeeze_signal: comp_score += 2
             elif '⚠️' in squeeze_signal: comp_score += 1
 
-            stop_loss = close_price - (Config.ATR_MULTIPLIER * atr)
-            risk_amount = Config.PORTFOLIO_VALUE * Config.RISK_PER_TRADE
-            max_position_value = Config.PORTFOLIO_VALUE * 0.25
+            # 【深水区优化 3：根据大盘政权动态调整风险偏好】
+            actual_atr_mult = 1.0 if regime == 'YELLOW' else Config.ATR_MULTIPLIER
+            actual_risk_pct = (Config.RISK_PER_TRADE / 2.0) if regime == 'YELLOW' else Config.RISK_PER_TRADE
             
-            if atr > 0 and close_price > 0 and close_price > stop_loss:
-                raw_shares = int(risk_amount / (close_price - stop_loss))
+            stop_loss = close_price - (actual_atr_mult * atr)
+            risk_amount = Config.PORTFOLIO_VALUE * actual_risk_pct
+            max_position_value = Config.PORTFOLIO_VALUE * (0.125 if regime == 'YELLOW' else 0.25)
+            
+            # 【兜底优化 2：防范停牌/极低波动标的引发除零崩溃 (ZeroDivisionError)】
+            stop_loss_dist = close_price - stop_loss
+            if atr > 0 and close_price > 0 and stop_loss_dist > 0.01:
+                raw_shares = int(risk_amount / stop_loss_dist)
                 if (raw_shares * close_price) > max_position_value:
                     raw_shares = int(max_position_value / close_price)
-                shares_str, stop_loss_str = f"{raw_shares} 股", f"${stop_loss:.2f}"
             else:
-                shares_str, stop_loss_str = "N/A", "N/A"
-
-            reasons = (
-                f"F-Score: {f_score}/9 | 增速: {revenue_growth:.1%} | 毛利: {gross_margin:.1%}\n"
-                f"  └ 🛡️ 风控: 建议买入 {shares_str} | 破位止损 {stop_loss_str}\n"
-                f"  └ 🎲 期权: {options_flow}\n"
-                f"  └ 📰 消息: {catalyst}\n"
-                f"  └ 🕵️‍♂️ 内幕: {insider_trading}\n"
-                f"  └ 🩸 轧空: {squeeze_signal}"
-            )
+                raw_shares = 0
 
             return {
                 '股票代码': symbol, '公司名称': info.get('longName', symbol),
                 '市值(亿美元)': round(market_cap / 1e8, 2), '营收增速': f"{revenue_growth:.1%}",
                 'F-Score': f"{f_score}/9", '综合得分': comp_score, '期权异动': options_flow,
                 '催化剂': catalyst, '内幕交易': insider_trading, '轧空雷达': squeeze_signal,
-                '最新收盘价': round(close_price, 2), '筛选理由': reasons, '链接': f"[https://finance.yahoo.com/quote/](https://finance.yahoo.com/quote/){symbol}"
+                '最新收盘价': round(close_price, 2), '止损价': round(stop_loss, 2),
+                '建议股数': raw_shares, 'F_Score_raw': f_score, 'gross_margin': gross_margin,
+                'revenue_growth_raw': revenue_growth
             }
         except Exception:
             if hasattr(thread_local, "session"):
@@ -667,7 +767,7 @@ def send_notifications(df, backtest_report=""):
         val = os.getenv(env_key)
         if not val: status_report.append(f"⚪ {platform}: 未配置"); continue
         try:
-            if platform == '微信': res = requests.get(f"[https://sctapi.ftqq.com/](https://sctapi.ftqq.com/){val}.send", params={"title": "🚀 V9.0 起爆预警", "desp": summary}, timeout=10)
+            if platform == '微信': res = requests.get(f"https://sctapi.ftqq.com/{val}.send", params={"title": "🚀 V9.0 起爆预警", "desp": summary}, timeout=10)
             elif platform == 'Telegram':
                 chat_id = os.getenv('TELEGRAM_CHAT_ID')
                 if not chat_id: status_report.append(f"⚪ Telegram: 缺 CHAT_ID"); continue
@@ -676,7 +776,7 @@ def send_notifications(df, backtest_report=""):
                 for i, link in enumerate(links): temp = temp.replace(link, f"@@LINKPLACEHOLDER_{i}@@")
                 tg_sum = temp.replace('_', '\\_').replace('*', '\\*')
                 for i, link in enumerate(links): tg_sum = tg_sum.replace(f"@@LINKPLACEHOLDER_{i}@@", link)
-                res = requests.post(f"[https://api.telegram.org/bot](https://api.telegram.org/bot){val}/sendMessage", json={"chat_id": chat_id, "text": tg_sum, "parse_mode": "Markdown"}, timeout=10)
+                res = requests.post(f"https://api.telegram.org/bot{val}/sendMessage", json={"chat_id": chat_id, "text": tg_sum, "parse_mode": "Markdown"}, timeout=10)
             else:
                 res = requests.post(val, json=({"msg_type": "text", "content": {"text": summary}} if platform == '飞书' else {"msgtype": "text", "text": {"content": summary}}), timeout=10)
             status_report.append(f"✅ {platform}: 成功" if res.status_code == 200 else f"❌ {platform}: 异常 ({res.text})")
@@ -690,18 +790,20 @@ def send_notifications(df, backtest_report=""):
 # 系统主干逻辑
 # ==========================================
 def main(dry_run=False, input_file=None):
-    logging.info("="*40 + " 🚀 GrowthHunter V9.0 (AI结构化研报与熔断排雷) " + "="*40)
+    logging.info("="*40 + " 🚀 GrowthHunter V9.0 (组合配资与多维防守体系) " + "="*40)
     if dry_run: logging.info("🏃 【DRY-RUN 空跑模式启动】")
     
     init_db()
     
-    is_safe, macro_reason = check_macro_regime()
-    if not is_safe:
-        logging.warning("🛑 宏观恶劣，触发系统熔断！")
+    regime, macro_reason = check_macro_regime()
+    if regime == 'RED':
+        logging.warning("🛑 宏观红灯，触发系统熔断！")
         if not dry_run:
             bt_report = run_auto_backtest()
-            send_notifications(pd.DataFrame(), f"🚨 **大盘熔断警告**\n{macro_reason}\n\n🛑 **防守指令**：今日暂停买入操作，注意破位止损！\n\n{bt_report}")
+            send_notifications(pd.DataFrame(), f"🚨 **大盘红灯熔断警告**\n{macro_reason}\n\n🛑 **防守指令**：今日暂停买入操作，注意破位止损！\n\n{bt_report}")
         return
+    elif regime == 'YELLOW':
+        logging.warning(f"⚠️ 宏观黄灯警告：{macro_reason}")
 
     tickers = get_small_cap_tickers(input_file=input_file)
     if not tickers: return
@@ -715,7 +817,7 @@ def main(dry_run=False, input_file=None):
         results = []
         logging.info(f"⏳ 第二阶段：深挖 {len(passed_tech_tickers)} 只标的财务、期权与做空面...")
         with ThreadPoolExecutor(max_workers=Config.THREAD_WORKERS) as executor:
-            futures = {executor.submit(analyze_fundamentals, sym, tech_data_dict.get(sym, {'close': 0.0, 'atr': 0.0})): sym for sym in passed_tech_tickers}
+            futures = {executor.submit(analyze_fundamentals, sym, tech_data_dict.get(sym, {'close': 0.0, 'atr': 0.0, 'tech_score': 0}), regime): sym for sym in passed_tech_tickers}
             for f in as_completed(futures):
                 res = f.result()
                 if res: results.append(res)
@@ -723,6 +825,48 @@ def main(dry_run=False, input_file=None):
 
     if not df.empty:
         df = df.sort_values(by=['综合得分', '市值(亿美元)'], ascending=[False, True])
+        
+        # 【深水区优化 2：真实组合记忆与可用资金动态计算】
+        remaining_cash = get_remaining_cash()
+        logging.info(f"💵 当前组合剩余可用资金: ${remaining_cash:.2f} / ${Config.PORTFOLIO_VALUE:.2f}")
+        
+        final_selected = []
+        
+        for _, row in df.iterrows():
+            shares = row['建议股数']
+            price = row['最新收盘价']
+            
+            # 【兜底优化 3：预留 1.5% 实盘滑点与交易费用缓冲，防止券商拒单】
+            slippage_price = price * 1.015
+            cost = shares * slippage_price
+            
+            if shares > 0 and remaining_cash >= cost:
+                remaining_cash -= cost
+                shares_str = f"{int(shares)} 股"
+            elif shares > 0 and remaining_cash >= slippage_price:
+                affordable_shares = int(remaining_cash / slippage_price)
+                cost = affordable_shares * slippage_price
+                remaining_cash -= cost
+                shares_str = f"{affordable_shares} 股 (受总资金限制调减)"
+                row['建议股数'] = affordable_shares # 同步至真实买入量供落库
+            else:
+                shares_str = "资金耗尽，暂不买入"
+                cost = 0
+                row['建议股数'] = 0 # 资金耗尽时阻断买入记录
+                
+            reasons = (
+                f"F-Score: {row['F_Score_raw']}/9 | 增速: {row['revenue_growth_raw']:.1%} | 毛利: {row['gross_margin']:.1%}\n"
+                f"  └ 🛡️ 风控: 建议买入 {shares_str} | 破位止损 ${row['止损价']:.2f} | 预估动用资金 ${cost:.2f} (含滑点)\n"
+                f"  └ 🩸 轧空: {row['轧空雷达']}"
+            )
+            row['筛选理由'] = reasons
+            row['链接'] = f"https://finance.yahoo.com/quote/{row['股票代码']}"
+            final_selected.append(row)
+            
+        df = pd.DataFrame(final_selected)
+        # 清理给资金计算用的中间变量，保持最终结果整洁
+        df = df.drop(columns=['止损价', '建议股数', 'F_Score_raw', 'gross_margin', 'revenue_growth_raw'], errors='ignore')
+
         md_df = df.copy()
         md_df['股票代码'] = md_df['股票代码'].apply(lambda x: f"[{x}](https://finance.yahoo.com/quote/{x})")
         df.to_csv('growth_hunter_results.csv', index=False)
@@ -731,6 +875,7 @@ def main(dry_run=False, input_file=None):
     
     if not dry_run:
         save_signals_to_db(df, len(tickers), len(passed_tech_tickers))
+        update_portfolio(final_selected) # 【同步更新真实持仓资金】
         backtest_report = run_auto_backtest()
         send_notifications(df, backtest_report)
 
