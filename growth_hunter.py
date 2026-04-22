@@ -6,6 +6,9 @@
 深度打磨：引入 Rule of 40、合并情绪因子降噪、动态ATR、消除回测前视偏差
 极致强化：严苛版营收加速度 (QoQ) + 毛利连续扩张 + 机构流向 + IBD式3重RS
 宏观雷达：流动性利差(HYG/LQD) + 强美元压制(UUP) + 风格轮动(XLK/XLE)
+精准点火：强制要求 🎯枢轴突破 / 🌊缩量反弹 / 🚀强势缺口 入场触发器
+头寸管理：【金字塔动态加仓(50-30-20) + 单一行业 30% 集中度防线】
+终极退出：【追踪止损(让利润奔跑) + 时间止损(清退死钱) + RS恶化提前逃顶】
 """
 
 import yfinance as yf
@@ -55,7 +58,7 @@ class Config:
     MARKET_CAP_MIN = 5e7
     MARKET_CAP_MAX = 3e9       
     REVENUE_GROWTH_MIN = 0.20
-    HYPER_GROWTH_THRESHOLD = 0.80 # 极速扩张豁免线 (同比增速 > 80%)
+    HYPER_GROWTH_THRESHOLD = 0.80 
     F_SCORE_MIN = 5
     SHORT_FLOAT_MIN = 0.20  
     SLEEP_MIN = 0.3
@@ -66,10 +69,11 @@ class Config:
     IO_WORKERS = 20         
     BENCHMARK_TICKER = 'IWM' 
     
-    # 风控与资金管理
+    # 风控与组合资金管理
     PORTFOLIO_VALUE = 100000 
     RISK_PER_TRADE = 0.01    
     ATR_MULTIPLIER = 1.5     
+    MAX_SECTOR_WEIGHT = 0.30 
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -81,7 +85,6 @@ USER_AGENTS = [
 thread_local = threading.local()
 
 def get_session():
-    """获取请求 Session，强制每次调用轮换 User-Agent 防止封禁"""
     if not hasattr(thread_local, "session"):
         thread_local.session = requests.Session()
     thread_local.session.headers.update({'User-Agent': random.choice(USER_AGENTS)})
@@ -93,7 +96,6 @@ def get_session():
 def check_macro_regime():
     logging.info("🌍 启动风控系统：扫描多维宏观与流动性矩阵 (Macro Regime)...")
     try:
-        # 新增流动性、汇率、板块风格代理 ETF
         macro_tickers = ["SPY", "IWM", "^VIX", "HYG", "LQD", "UUP", "XLK", "XLE"]
         macro_data = yf.download(macro_tickers, period="1y", group_by="ticker", progress=False)
         
@@ -121,7 +123,6 @@ def check_macro_regime():
         
         last_vix = float(vix.iloc[-1])
         
-        # 🔴 一级红灯熔断 (绝对熊市或极端恐慌)
         if spy is not None:
             spy_ma200 = float(spy.rolling(200).mean().iloc[-1])
             last_spy = float(spy.iloc[-1])
@@ -132,7 +133,6 @@ def check_macro_regime():
                 
         yellow_reasons = []
         
-        # 🟡 传统小盘股破位
         if iwm is not None:
             iwm_ma20 = float(iwm.rolling(20).mean().iloc[-1])
             iwm_ma50 = float(iwm.rolling(50).mean().iloc[-1])
@@ -143,20 +143,17 @@ def check_macro_regime():
         if last_vix > 20.0:
             yellow_reasons.append(f"波动率升温(VIX>20)")
 
-        # 🟡 流动性与信用利差抽水 (HYG/LQD 比值)
         if hyg is not None and lqd is not None:
             cred_spread = hyg / lqd
             cred_ma50 = float(cred_spread.rolling(50).mean().iloc[-1])
             if cred_spread.iloc[-1] < cred_ma50:
                 yellow_reasons.append("高收益债利差走阔(资金避险)")
 
-        # 🟡 强美元估值压制 (UUP 美元基金)
         if uup is not None:
             uup_ma50 = float(uup.rolling(50).mean().iloc[-1])
             if uup.iloc[-1] > uup_ma50 and uup.iloc[-1] > uup.iloc[-20]:
                 yellow_reasons.append("美元指数走强(杀估值)")
 
-        # 🟡 成长/价值 风格轮动 (XLK/XLE 比值)
         if xlk is not None and xle is not None:
             growth_value = xlk / xle
             gv_ma50 = float(growth_value.rolling(50).mean().iloc[-1])
@@ -205,6 +202,8 @@ def init_db():
             cost_basis REAL, purchase_date TEXT
         )
     ''')
+    try: c.execute('ALTER TABLE portfolio_holdings ADD COLUMN sector TEXT')
+    except sqlite3.OperationalError: pass
     
     c.execute('''
         CREATE TABLE IF NOT EXISTS portfolio_summary (
@@ -251,19 +250,30 @@ def save_signals_to_db(df, tickers_scanned_count, passed_tech_count):
     except Exception as e:
         logging.error(f"⚠️ 数据库保存失败: {e}")
 
-def get_remaining_cash():
+def get_portfolio_state():
     try:
         conn = sqlite3.connect('growth_hunter_signals.db')
-        df_holdings = pd.read_sql_query("SELECT shares, cost_basis FROM portfolio_holdings", conn)
+        df_holdings = pd.read_sql_query("SELECT symbol, shares, cost_basis, sector FROM portfolio_holdings", conn)
         df_pnl = pd.read_sql_query("SELECT realized_pnl FROM portfolio_summary WHERE id=1", conn)
         conn.close()
         
         realized_pnl = df_pnl.iloc[0]['realized_pnl'] if not df_pnl.empty else 0.0
-        invested = (df_holdings['shares'] * df_holdings['cost_basis']).sum() if not df_holdings.empty else 0.0
+        holdings_dict = {}
+        sector_exposure = {}
+        invested = 0.0
         
-        return max(0, Config.PORTFOLIO_VALUE + realized_pnl - invested)
+        if not df_holdings.empty:
+            for _, row in df_holdings.iterrows():
+                val = row['shares'] * row['cost_basis']
+                invested += val
+                sec = row['sector'] if row['sector'] else 'Unknown'
+                holdings_dict[row['symbol']] = {'shares': row['shares'], 'cost_basis': row['cost_basis'], 'sector': sec}
+                sector_exposure[sec] = sector_exposure.get(sec, 0.0) + val
+                
+        remaining_cash = max(0, Config.PORTFOLIO_VALUE + realized_pnl - invested)
+        return remaining_cash, holdings_dict, sector_exposure
     except Exception:
-        return Config.PORTFOLIO_VALUE
+        return Config.PORTFOLIO_VALUE, {}, {}
 
 def update_portfolio(selected_rows):
     try:
@@ -273,23 +283,35 @@ def update_portfolio(selected_rows):
         for row in selected_rows:
             shares = row.get('建议股数', 0)
             if isinstance(shares, int) and shares > 0:
-                conn.execute('''
-                    INSERT INTO portfolio_holdings (symbol, shares, cost_basis, purchase_date)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(symbol) DO UPDATE SET
-                        cost_basis = ((cost_basis * shares) + (excluded.cost_basis * excluded.shares)) / (shares + excluded.shares),
-                        shares = shares + excluded.shares,
-                        purchase_date = excluded.purchase_date
-                ''', (row['股票代码'], shares, row['最新收盘价'], today))
+                try:
+                    conn.execute('''
+                        INSERT INTO portfolio_holdings (symbol, shares, cost_basis, purchase_date, sector)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol) DO UPDATE SET
+                            cost_basis = ((cost_basis * shares) + (excluded.cost_basis * excluded.shares)) / (shares + excluded.shares),
+                            shares = shares + excluded.shares,
+                            purchase_date = excluded.purchase_date,
+                            sector = excluded.sector
+                    ''', (row['股票代码'], shares, row['最新收盘价'], today, row.get('行业', 'Unknown')))
+                except sqlite3.OperationalError:
+                    conn.execute('''
+                        INSERT INTO portfolio_holdings (symbol, shares, cost_basis, purchase_date)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(symbol) DO UPDATE SET
+                            cost_basis = ((cost_basis * shares) + (excluded.cost_basis * excluded.shares)) / (shares + excluded.shares),
+                            shares = shares + excluded.shares,
+                            purchase_date = excluded.purchase_date
+                    ''', (row['股票代码'], shares, row['最新收盘价'], today))
                 updated_count += 1
         conn.commit()
         conn.close()
-        if updated_count > 0: logging.info(f"💼 组合持仓同步：{updated_count} 只标的入账。")
+        if updated_count > 0: logging.info(f"💼 组合持仓同步：{updated_count} 笔订单入账。")
     except Exception as e:
         logging.error(f"⚠️ 持仓状态更新失败: {e}")
 
 def review_portfolio():
-    logging.info("🧐 开始执行盘前持仓体检与自动退出逻辑 (Exit Logic)...")
+    """【退出优化】：动态追踪止损、时间止损与RS恶化审查"""
+    logging.info("🧐 开始执行盘前持仓体检与动态退出逻辑 (Dynamic Exit Logic)...")
     try:
         conn = sqlite3.connect('growth_hunter_signals.db')
         holdings = pd.read_sql_query("SELECT * FROM portfolio_holdings", conn)
@@ -300,23 +322,34 @@ def review_portfolio():
 
         sell_report = []
         tickers = holdings['symbol'].tolist()
+        dl_list = tickers + [Config.BENCHMARK_TICKER]
         
-        data = yf.download(tickers, period="1y", group_by="ticker", progress=False)
+        # 批量获取持仓与大盘数据
+        data = yf.download(dl_list, period="1y", group_by="ticker", progress=False)
+        
+        iwm_close = None
+        if isinstance(data.columns, pd.MultiIndex) and Config.BENCHMARK_TICKER in data.columns.levels[0]:
+            iwm_close = data[Config.BENCHMARK_TICKER]['Close']
+        elif not isinstance(data.columns, pd.MultiIndex) and 'Close' in data.columns and Config.BENCHMARK_TICKER in dl_list:
+            iwm_close = data['Close']
+        if iwm_close is not None and getattr(iwm_close.index, 'tz', None) is not None:
+            iwm_close.index = iwm_close.index.tz_localize(None)
+
         pnl_update = 0.0
         symbols_to_remove = []
 
         for _, row in holdings.iterrows():
             sym = row['symbol']
             try:
-                if len(tickers) == 1:
-                    df = data.copy()
-                else:
-                    if sym not in data.columns.levels[0] and sym not in data.columns.levels[1]:
-                        continue
+                if isinstance(data.columns, pd.MultiIndex):
+                    if sym not in data.columns.levels[0]: continue
                     df = data[sym].copy()
+                else:
+                    df = data.copy()
 
                 df = df.dropna(subset=['Close'])
-                if len(df) < 50: continue
+                if len(df) < 20: continue
+                if getattr(df.index, 'tz', None) is not None: df.index = df.index.tz_localize(None)
 
                 df.ta.supertrend(length=7, multiplier=3.0, append=True)
                 st_dir_col = next((col for col in df.columns if col.startswith('SUPERTd_')), None)
@@ -324,19 +357,51 @@ def review_portfolio():
                 current_close = float(df['Close'].iloc[-1])
                 cost_basis = float(row['cost_basis'])
                 shares = int(row['shares'])
+                
+                # 提取买入时间后的表现用于计算追踪止损与时间止损
+                purchase_date_str = row.get('purchase_date', '')
+                try:
+                    p_date = pd.to_datetime(purchase_date_str).tz_localize(None)
+                    df_post = df[df.index >= p_date]
+                    max_high = float(df_post['High'].max()) if not df_post.empty else current_close
+                    trading_days_held = len(df_post)
+                except Exception:
+                    max_high = current_close
+                    trading_days_held = 0
 
                 is_downtrend = (df[st_dir_col].iloc[-1] == -1) if st_dir_col else False
                 is_hard_stop = current_close < cost_basis * 0.85
-                is_take_profit = current_close >= cost_basis * 2.0
+                
+                # 【退出改进 1】：追踪止损 (代替硬翻倍止盈，让利润奔跑，回撤20%锁定)
+                is_trailing_stop = current_close <= max_high * 0.80
+                
+                # 【退出改进 2】：时间止损 (持仓超60天但涨幅不足10%，清退死钱)
+                is_time_stop = trading_days_held >= 60 and current_close < cost_basis * 1.10
+                
+                # 【退出改进 3】：RS 恶化预警
+                is_rs_deteriorated = False
+                if iwm_close is not None:
+                    aligned_iwm = iwm_close.reindex(df.index).interpolate(method='linear').ffill()
+                    rs_line = df['Close'] / aligned_iwm
+                    rs_sma50 = rs_line.rolling(window=50).mean()
+                    # 如果 RS 跌破自身 50日均线，且股票并没有很厚的利润垫 (<20%)，提前逃顶
+                    if pd.notna(rs_sma50.iloc[-1]) and rs_line.iloc[-1] < rs_sma50.iloc[-1]:
+                        if current_close < cost_basis * 1.20:
+                            is_rs_deteriorated = True
 
-                if is_downtrend or is_hard_stop or is_take_profit:
+                exit_reason = ""
+                if is_hard_stop: exit_reason = "🛑 触及硬止损 (-15%)"
+                elif is_trailing_stop: exit_reason = f"🏆 追踪止盈 (高点回撤20%, 巅峰${max_high:.2f})"
+                elif is_rs_deteriorated: exit_reason = "⚠️ RS恶化 (跑输大盘，提前清仓)"
+                elif is_downtrend: exit_reason = "📉 趋势破位 (SuperTrend翻红)"
+                elif is_time_stop: exit_reason = f"⏳ 时间止损 (耗时{trading_days_held}天无表现)"
+
+                if exit_reason:
                     realized = (current_close - cost_basis) * shares
                     pnl_update += realized
                     symbols_to_remove.append(sym)
-
-                    reason = "📈 翻倍止盈" if is_take_profit else ("📉 趋势破位" if is_downtrend else "🛑 触及硬止损")
                     ret_pct = (current_close - cost_basis) / cost_basis
-                    sell_report.append(f"  └ 卖出 [{sym}] ({reason}): 成本 ${cost_basis:.2f} -> 卖出价 ${current_close:.2f} (盈亏: {ret_pct:+.1%}, 释放回笼: ${current_close * shares:.2f})")
+                    sell_report.append(f"  └ 卖出 [{sym}] ({exit_reason}): 成本 ${cost_basis:.2f} -> 卖价 ${current_close:.2f} (盈亏: {ret_pct:+.1%}, 回笼: ${current_close * shares:.2f})")
 
             except Exception as e:
                 logging.debug(f"持仓审查异常 {sym}: {e}")
@@ -351,7 +416,7 @@ def review_portfolio():
 
         if sell_report:
             logging.info(f"♻️ 完成清仓退出，释放资金，总盈亏更新: ${pnl_update:+.2f}")
-            return "♻️ **【组合自动调仓 (卖出与退出)】**\n" + "\n".join(sell_report) + "\n\n"
+            return "♻️ **【组合动态调仓与止盈防线】**\n" + "\n".join(sell_report) + "\n\n"
         return ""
     except Exception as e:
         logging.error(f"持仓审查发生致命错误: {e}")
@@ -560,7 +625,7 @@ def get_small_cap_tickers(input_file=None):
     logging.error("❌ 所有网络股票池获取失败，启动扩容版保底防线...")
     return ['LUNR', 'BBAI', 'SOUN', 'GCT', 'VLD', 'STEM', 'IONQ', 'JOBY', 'ACHR', 'HUT', 'CLSK', 'BITF', 'IREN', 'WOLF', 'PLTR', 'HOOD', 'RDDT', 'RIVN', 'ASTS', 'LCID', 'MSTR']
 
-def check_unfilled_gap(df, lookback=10):
+def check_unfilled_gap(df, lookback=5):
     if len(df) < lookback + 2: return False
     gap_up = (df['Low'] > df['High'].shift(1)) & (df['Open'] > df['Close'].shift(1) * 1.02)
     gap_indices = gap_up.iloc[-lookback:].index[gap_up.iloc[-lookback:]]
@@ -635,36 +700,52 @@ def batch_technical_screen(tickers):
             kc_upper = sma20 + 1.5 * df[atr_col]
             kc_lower = sma20 - 1.5 * df[atr_col]
             
-            squeeze_on = (bb_upper < kc_upper) & (bb_lower > kc_lower)
-            is_squeeze_break = (current_close > kc_upper.iloc[idx]) and (squeeze_on.iloc[-2] if len(squeeze_on) >= 2 else False)
+            is_uptrend = (df[st_dir_col].iloc[idx] == 1)
+            if not is_uptrend: continue
+
+            active_triggers = []
+
+            highest_5w = df['High'].shift(1).rolling(window=25).max()
+            is_pivot_breakout = current_close > highest_5w.iloc[idx]
+            if is_pivot_breakout: active_triggers.append("🎯枢轴突破")
+
+            recent_vol_quiet = df['Volume'].iloc[idx-3:idx].mean() < vol_ma20.iloc[idx] * 0.8
+            today_vol_spike = current_vol > vol_ma20.iloc[idx] * 1.5
+            price_rebound = (current_close > df['Close'].iloc[idx-1]) and (current_close > sma20.iloc[idx])
+            is_vcp_rebound = recent_vol_quiet and today_vol_spike and price_rebound
+            if is_vcp_rebound: active_triggers.append("🌊缩量反弹")
+
+            recent_gap = check_unfilled_gap(df, lookback=5)
+            if recent_gap: active_triggers.append("🚀强势缺口")
+
+            if not active_triggers:
+                continue
             
             aligned_iwm = iwm_close.reindex(df.index).interpolate(method='linear').ffill() if iwm_close is not None else df['Close'] * 0
             rs_line = df['Close'] / aligned_iwm
-            rs_sma50 = rs_line.rolling(window=50).mean()   # 约 2.5 个月
-            rs_sma65 = rs_line.rolling(window=65).mean()   # 约 3 个月
-            rs_sma130 = rs_line.rolling(window=130).mean() # 约 6 个月
+            rs_sma50 = rs_line.rolling(window=50).mean()   
+            rs_sma65 = rs_line.rolling(window=65).mean()   
+            rs_sma130 = rs_line.rolling(window=130).mean() 
             
             rs_condition = (rs_line.iloc[idx] > rs_sma50.iloc[idx] if not pd.isna(rs_sma50.iloc[idx]) else False) and \
                            (rs_line.iloc[idx] > rs_sma65.iloc[idx] if not pd.isna(rs_sma65.iloc[idx]) else False) and \
                            (rs_line.iloc[idx] > rs_sma130.iloc[idx] if not pd.isna(rs_sma130.iloc[idx]) else False)
-
-            has_unfilled_gap = check_unfilled_gap(df, lookback=10)
-            
-            is_uptrend = (df[st_dir_col].iloc[idx] == 1)
-            if not is_uptrend: continue
                 
             tech_score = 0
             if current_vol > max(vol_ma20.iloc[idx] * 1.5, vol_95th.iloc[idx] * 0.8): tech_score += 1
             if rs_condition: tech_score += 1
-            if is_squeeze_break or has_unfilled_gap: tech_score += 1
             if df[cmf_col].iloc[idx] > 0: tech_score += 1
             
-            if tech_score >= 2:
-                passed_tickers.append(sym)
-                tech_data[sym] = {'close': float(current_close), 'atr': float(df[atr_col].iloc[idx]), 'tech_score': tech_score}
+            passed_tickers.append(sym)
+            tech_data[sym] = {
+                'close': float(current_close), 
+                'atr': float(df[atr_col].iloc[idx]), 
+                'tech_score': tech_score,
+                'triggers': " | ".join(active_triggers)
+            }
         except Exception: continue
             
-    logging.info(f"🎯 阶段一完成：技术面保留 {len(passed_tickers)} 只标的")
+    logging.info(f"🎯 阶段一完成：带有明确点火信号(Trigger)的标的仅剩 {len(passed_tickers)} 只")
     return passed_tickers, tech_data
 
 def calculate_piotroski_f_score(bs, cf, inc):
@@ -729,9 +810,10 @@ def calculate_piotroski_f_score(bs, cf, inc):
         return f_score
     except Exception: return "N/A"
 
-def analyze_fundamentals(symbol, tech_info, regime, io_executor):
+def analyze_fundamentals(symbol, tech_info, regime, io_executor, portfolio_state):
     close_price = tech_info.get('close', 0.0)
     atr = tech_info.get('atr', 0.0)
+    entry_trigger = tech_info.get('triggers', '')
     
     time.sleep(random.uniform(Config.SLEEP_MIN, Config.SLEEP_MAX))
     for attempt in range(2):
@@ -756,9 +838,9 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
                     
             if not info or 'longName' not in info: return None
 
+            sector = info.get('sector', 'Unknown')
             revenue_growth = info.get('revenueGrowth')
             gross_margin = info.get('grossMargins')
-            
             inst_held = info.get('heldPercentInstitutions', 0.0) + info.get('heldPercentInsiders', 0.0)
             
             op_margin = info.get('operatingMargins')
@@ -771,7 +853,7 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             tech_score = tech_info.get('tech_score', 0)
             is_hyper_growth = revenue_growth is not None and revenue_growth >= Config.HYPER_GROWTH_THRESHOLD
             
-            has_momentum_privilege = (tech_score >= 3)
+            has_momentum_privilege = True
             
             is_growth_exempt = is_hyper_growth or has_momentum_privilege or is_rule_of_40_pass
             req_growth = 0.0 if is_growth_exempt else Config.REVENUE_GROWTH_MIN
@@ -889,31 +971,66 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             
             stop_loss = close_price - (actual_atr_mult * atr)
             risk_amount = Config.PORTFOLIO_VALUE * actual_risk_pct
-            max_position_value = Config.PORTFOLIO_VALUE * (0.125 if regime == 'YELLOW' else 0.25)
             
             stop_loss_dist = close_price - stop_loss
+            target_raw_shares = 0
             if atr > 0 and close_price > 0 and stop_loss_dist > 0.01:
-                raw_shares = int(risk_amount / stop_loss_dist)
-                if (raw_shares * close_price) > max_position_value:
-                    raw_shares = int(max_position_value / close_price)
-            else:
-                raw_shares = 0
+                target_raw_shares = int(risk_amount / stop_loss_dist)
+                max_pos_val = Config.PORTFOLIO_VALUE * (0.125 if regime == 'YELLOW' else 0.25)
+                if (target_raw_shares * close_price) > max_pos_val:
+                    target_raw_shares = int(max_pos_val / close_price)
+                    
+            if target_raw_shares <= 0: return None
+            
+            shares_to_buy = 0
+            action_tag = ""
+            target_value = target_raw_shares * close_price
+            
+            if symbol in portfolio_state['holdings']:
+                held_info = portfolio_state['holdings'][symbol]
+                profit_pct = (close_price - held_info['cost_basis']) / held_info['cost_basis']
+                current_value = held_info['shares'] * close_price
                 
+                if profit_pct >= 0.15 and current_value < target_value * 0.85:
+                    shares_to_buy = int(target_raw_shares * 0.20)
+                    action_tag = f"🔼加仓(浮盈{profit_pct:.1%}, 追加最后20%)"
+                elif profit_pct >= 0.10 and current_value < target_value * 0.55:
+                    shares_to_buy = int(target_raw_shares * 0.30)
+                    action_tag = f"🔼加仓(浮盈{profit_pct:.1%}, 追加30%)"
+                else:
+                    return None 
+            else:
+                shares_to_buy = int(target_raw_shares * 0.50)
+                action_tag = "🆕建仓(首发50%)"
+                
+            if shares_to_buy <= 0: return None
+            
+            available_sector_cash = (Config.PORTFOLIO_VALUE * Config.MAX_SECTOR_WEIGHT) - portfolio_state['sector_exposure'].get(sector, 0.0)
+            cost_est = shares_to_buy * close_price
+            
+            if available_sector_cash <= 0:
+                logging.info(f"🚫 {symbol} 被风控拦截: [{sector}] 行业集中度已达 {Config.MAX_SECTOR_WEIGHT:.0%} 上限。")
+                return None
+            elif cost_est > available_sector_cash:
+                shares_to_buy = int(available_sector_cash / close_price)
+                if shares_to_buy <= 0: return None
+                action_tag += " [受限于行业上限降档]"
+
             core_tags = []
             if rev_accel: core_tags.append("🔥营收加速(QoQ)")
             if margin_exp: core_tags.append("📈毛利扩张")
             if inst_held > 0.20: core_tags.append(f"🏦大资金入驻({inst_held:.1%})")
-            if has_momentum_privilege: core_tags.append("🛡️免检数据豁免")
             core_str = " | ".join(core_tags) if core_tags else "基本面平稳"
 
             return {
-                '股票代码': symbol, '公司名称': info.get('longName', symbol),
+                '股票代码': symbol, '公司名称': info.get('longName', symbol), '行业': sector,
                 '市值(亿美元)': round(market_cap / 1e8, 2), '营收增速': f"{revenue_growth:.1%}",
                 'F-Score': f"{f_score}/9", '综合得分': comp_score, '期权异动': options_flow,
                 '催化剂': catalyst, '散户情绪': reddit_signal, '内幕交易': insider_trading, '轧空雷达': squeeze_signal,
                 '最新收盘价': round(close_price, 2), '止损价': round(stop_loss, 2),
-                '建议股数': raw_shares, 'F_Score_raw': f_score, 'gross_margin': gross_margin,
-                'revenue_growth_raw': revenue_growth, '核心质地': core_str, 'rule_of_40': rule_of_40
+                '建议股数': shares_to_buy, 'F_Score_raw': f_score, 'gross_margin': gross_margin,
+                'revenue_growth_raw': revenue_growth, '核心质地': core_str, 'rule_of_40': rule_of_40,
+                '买入触发': entry_trigger, '交易动作': action_tag
             }
         except Exception:
             if hasattr(thread_local, "session"):
@@ -990,7 +1107,7 @@ def send_notifications(df, sell_report="", backtest_report=""):
     if sell_report:
         summary += sell_report
         
-    summary += (f"【新增捕获】 {len(df)} 只底盘扎实且量价齐升的起爆股：\n\n" if not df.empty else "今日无新增达标买入标的。\n\n")
+    summary += (f"【新增捕获】 {len(df)} 只底盘扎实且主升浪确认的起爆股：\n\n" if not df.empty else "今日无新增达标买入标的。\n\n")
     for _, row in df.head(10).iterrows():
         item = f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
         if len(summary) + len(item) > 3500: summary += "...（已自动截断）\n\n"; break
@@ -1047,15 +1164,18 @@ def main(dry_run=False, input_file=None):
     final_selected = []
 
     if not passed_tech_tickers:
-        logging.info("📉 今日无新标的通过技术面初筛。")
+        logging.info("📉 今日无新标的通过入场触发器初筛。")
         df = pd.DataFrame()
     else:
         results = []
         logging.info(f"⏳ 第二阶段：深挖 {len(passed_tech_tickers)} 只新标的财务、期权、散户情绪与风投叙事...")
         
+        remaining_cash, current_holdings, sector_exposure = get_portfolio_state()
+        portfolio_state = {'holdings': current_holdings, 'sector_exposure': sector_exposure}
+        
         with ThreadPoolExecutor(max_workers=Config.IO_WORKERS) as io_exec:
             with ThreadPoolExecutor(max_workers=Config.THREAD_WORKERS) as executor:
-                futures = {executor.submit(analyze_fundamentals, sym, tech_data_dict.get(sym, {'close': 0.0, 'atr': 0.0, 'tech_score': 0}), regime, io_exec): sym for sym in passed_tech_tickers}
+                futures = {executor.submit(analyze_fundamentals, sym, tech_data_dict.get(sym, {'close': 0.0, 'atr': 0.0, 'tech_score': 0}), regime, io_exec, portfolio_state): sym for sym in passed_tech_tickers}
                 for f in as_completed(futures):
                     res = f.result()
                     if res: results.append(res)
@@ -1064,7 +1184,6 @@ def main(dry_run=False, input_file=None):
     if not df.empty:
         df = df.sort_values(by=['综合得分', '市值(亿美元)'], ascending=[False, True])
         
-        remaining_cash = get_remaining_cash()
         logging.info(f"💵 当前组合剩余可用资金: ${remaining_cash:.2f} / 初始净值 ${Config.PORTFOLIO_VALUE:.2f}")
         
         for _, row in df.iterrows():
@@ -1089,8 +1208,9 @@ def main(dry_run=False, input_file=None):
                 
             reasons = (
                 f"R40法则: {row['rule_of_40']:.1f}% | 增速: {row['revenue_growth_raw']:.1%} | F-Score: {row['F_Score_raw']}/9\n"
+                f"  └ ⚡ 触发: {row['买入触发']}\n"
                 f"  └ 💎 质地: {row['核心质地']}\n"
-                f"  └ 🛡️ 风控: 建议买入 {shares_str} | 破位止损 ${row['止损价']:.2f} | 预估动用 ${cost:.2f}\n"
+                f"  └ 🛡️ 风控: {row['交易动作']} {shares_str} | 破位止损 ${row['止损价']:.2f} | 预估动用 ${cost:.2f}\n"
                 f"  └ 🎲 另类: {row['期权异动']} | {row['散户情绪']}\n"
                 f"  └ 📰 消息: {row['催化剂']}\n"
                 f"  └ 🩸 筹码: {row['内幕交易']} | {row['轧空雷达']}"
@@ -1100,7 +1220,7 @@ def main(dry_run=False, input_file=None):
             final_selected.append(row)
             
         df = pd.DataFrame(final_selected)
-        df = df.drop(columns=['止损价', '建议股数', 'F_Score_raw', 'gross_margin', 'revenue_growth_raw', 'rule_of_40', '核心质地'], errors='ignore')
+        df = df.drop(columns=['止损价', '建议股数', 'F_Score_raw', 'gross_margin', 'revenue_growth_raw', 'rule_of_40', '核心质地', '买入触发', '交易动作', '行业'], errors='ignore')
 
         md_df = df.copy()
         md_df['股票代码'] = md_df['股票代码'].apply(lambda x: f"[{x}](https://finance.yahoo.com/quote/{x})")
@@ -1117,8 +1237,8 @@ def main(dry_run=False, input_file=None):
 def test_notifications():
     logging.info("🔧 推送测试...")
     init_db()
-    save_signals_to_db(pd.DataFrame([{'股票代码': 'TEST', '公司名称': '配置测试股', '市值(亿美元)': 8.8, '营收增速': '50%', 'F-Score': '9/9', '综合得分': 7, '期权异动': '🔥 爆单', '催化剂': '🚀 情绪95 [财报超预期] 利润翻倍指引上调', '散户情绪': '🦍 极度狂热', '内幕交易': '🚨 买入', '轧空雷达': '🩸 轧空', '最新收盘价': 100.5, '筛选理由': 'V10.0 Reddit 引擎就绪！', 'data_tag': ''}]), 1, 1)
-    send_notifications(pd.DataFrame(), "♻️ **【组合自动调仓】**\n  └ 卖出 [TEST] (📈 翻倍止盈): 成本 $50 -> 卖出价 $100\n\n", "\n📊 【战报】\n • T+1 (推 3只): 胜率 67% | 均收益 +4.2%\n")
+    save_signals_to_db(pd.DataFrame([{'股票代码': 'TEST', '公司名称': '配置测试股', '市值(亿美元)': 8.8, '营收增速': '50%', 'F-Score': '9/9', '综合得分': 7, '期权异动': '🔥 爆单', '催化剂': '🚀 情绪95 [财报超预期] 利润翻倍指引上调', '散户情绪': '🦍 极度狂热', '内幕交易': '🚨 买入', '轧空雷达': '🩸 轧空', '最新收盘价': 100.5, '买入触发': '🎯枢轴突破 | 🚀强势缺口', '核心质地': '🔥营收加速', '交易动作': '🆕建仓(首发50%)', '行业': 'Technology', '筛选理由': 'V10.0 Reddit 引擎就绪！', 'data_tag': ''}]), 1, 1)
+    send_notifications(pd.DataFrame(), "♻️ **【组合动态调仓与止盈防线】**\n  └ 卖出 [TEST] (🏆 追踪止盈 (高点回撤20%, 巅峰$120.00)): 成本 $50 -> 卖价 $96 (盈亏: +92.0%, 回笼: $14400.00)\n\n", "\n📊 【战报】\n • T+1 (推 3只): 胜率 67% | 均收益 +4.2%\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
