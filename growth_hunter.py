@@ -4,6 +4,7 @@
 进阶能力：全生命周期资金闭环 (动态止盈止损 + 资金复利滚动)
 行情适配：维基百科稳定股票池 + 极强动能免检特权，破除好行情踏空盲区
 深度打磨：引入 Rule of 40、合并情绪因子降噪、动态ATR、消除回测前视偏差
+核心补齐：营收加速度 (Revenue Acceleration) + 毛利扩张 + 机构持仓 + 6个月多维RS
 """
 
 import yfinance as yf
@@ -587,10 +588,14 @@ def batch_technical_screen(tickers):
             squeeze_on = (bb_upper < kc_upper) & (bb_lower > kc_lower)
             is_squeeze_break = (current_close > kc_upper.iloc[idx]) and (squeeze_on.iloc[-2] if len(squeeze_on) >= 2 else False)
             
+            # 【策略修正：多时间维度相对强度 RS (50日中期 & 130日长期跑赢大盘)】
             aligned_iwm = iwm_close.reindex(df.index).interpolate(method='linear').ffill() if iwm_close is not None else df['Close'] * 0
             rs_line = df['Close'] / aligned_iwm
             rs_sma50 = rs_line.rolling(window=50).mean()
-            rs_condition = rs_line.iloc[idx] > rs_sma50.iloc[idx] if not pd.isna(rs_sma50.iloc[idx]) else False
+            rs_sma130 = rs_line.rolling(window=130).mean()
+            
+            rs_condition = (rs_line.iloc[idx] > rs_sma50.iloc[idx] if not pd.isna(rs_sma50.iloc[idx]) else False) and \
+                           (rs_line.iloc[idx] > rs_sma130.iloc[idx] if not pd.isna(rs_sma130.iloc[idx]) else False)
 
             has_unfilled_gap = check_unfilled_gap(df, lookback=10)
             
@@ -702,8 +707,8 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
 
             revenue_growth = info.get('revenueGrowth')
             gross_margin = info.get('grossMargins')
+            inst_held = info.get('heldPercentInstitutions', 0)
             
-            # 【策略修正 1】：引入 Rule of 40 (40法则)
             op_margin = info.get('operatingMargins')
             if op_margin is None: 
                 op_margin = (gross_margin - 0.20) if gross_margin else 0.0
@@ -714,10 +719,8 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             tech_score = tech_info.get('tech_score', 0)
             is_hyper_growth = revenue_growth is not None and revenue_growth >= Config.HYPER_GROWTH_THRESHOLD
             
-            # 【策略修正 2】：即使动能极强，也拒绝营收负增长的纯垃圾股
             has_momentum_privilege = (tech_score >= 3)
             
-            # 如果满足 Rule of 40、极速扩张或动能特权，F-Score 门槛降为 0
             is_growth_exempt = is_hyper_growth or has_momentum_privilege or is_rule_of_40_pass
             req_growth = 0.0 if is_growth_exempt else Config.REVENUE_GROWTH_MIN
             req_margin = 0.05 if is_growth_exempt else 0.20
@@ -730,20 +733,39 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             if gross_margin is None or gross_margin < req_margin: return None
 
             inc, bs, cf = ticker.income_stmt, ticker.balance_sheet, ticker.cashflow
+            q_inc = ticker.quarterly_income_stmt
             
+            # 【核心因子补齐】：提取营收加速度与毛利率扩张趋势 (近3季度环比比较)
+            rev_accel, margin_exp = False, False
+            if q_inc is not None and not q_inc.empty:
+                try:
+                    rev_row = next((q_inc.loc[k] for k in ['Total Revenue', 'Operating Revenue', 'Revenue'] if k in q_inc.index), None)
+                    gp_row = next((q_inc.loc[k] for k in ['Gross Profit', 'Total Gross Profit'] if k in q_inc.index), None)
+                    
+                    if rev_row is not None and len(rev_row.dropna()) >= 3:
+                        revs = rev_row.dropna().values
+                        g1 = (revs[0] - revs[1]) / revs[1] if revs[1] else 0
+                        g2 = (revs[1] - revs[2]) / revs[2] if revs[2] else 0
+                        if g1 > g2 > 0: rev_accel = True
+                        
+                    if gp_row is not None and rev_row is not None and len(gp_row.dropna()) >= 2 and len(rev_row.dropna()) >= 2:
+                        gps = gp_row.dropna().values
+                        rvs = rev_row.dropna().values
+                        m1 = gps[0] / rvs[0] if rvs[0] else 0
+                        m2 = gps[1] / rvs[1] if rvs[1] else 0
+                        if m1 > m2 > 0: margin_exp = True
+                except Exception: pass
+            
+            # (后置兜底)
             if (revenue_growth is None or gross_margin is None) and not inc.empty:
                 try:
                     rev_row = next((inc.loc[k] for k in ['Total Revenue', 'Operating Revenue', 'Revenue'] if k in inc.index), None)
                     gp_row = next((inc.loc[k] for k in ['Gross Profit', 'Total Gross Profit'] if k in inc.index), None)
-                    
                     if revenue_growth is None and rev_row is not None and len(rev_row.dropna()) >= 2:
                         rv = rev_row.dropna()
-                        try: 
-                            rv.index = pd.to_datetime(rv.index)
-                            rv = rv.sort_index(ascending=False)
-                        except Exception: pass
+                        try: rv.index = pd.to_datetime(rv.index); rv = rv.sort_index(ascending=False)
+                        except: pass
                         if rv.iloc[1] > 0: revenue_growth = (rv.iloc[0] - rv.iloc[1]) / rv.iloc[1]
-                    
                     if gross_margin is None and gp_row is not None and rev_row is not None:
                         gp, rv = gp_row.dropna(), rev_row.dropna()
                         if len(gp) > 0 and len(rv) > 0 and rv.iloc[0] > 0: gross_margin = gp.iloc[0] / rv.iloc[0]
@@ -751,8 +773,6 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
 
             if revenue_growth is None or revenue_growth < req_growth: return None
             if gross_margin is None or gross_margin < req_margin: return None
-            
-            data_tag = "[数据豁免/补算]" if has_momentum_privilege else ""
             
             f_score = calculate_piotroski_f_score(bs, cf, inc)
             if not isinstance(f_score, int):
@@ -782,10 +802,9 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
                 if short_float >= Config.SHORT_FLOAT_MIN: squeeze_signal = f"🩸 世纪轧空 ({short_float:.1%})"
                 elif short_float >= 0.10: squeeze_signal = f"⚠️ 高度做空 ({short_float:.1%})"
 
-            # 【策略修正 3】：因子降噪与归一化
             comp_score = 0
             if f_score >= req_f_score and not is_growth_exempt:
-                comp_score += (f_score - req_f_score)  # 给价值型提供加分
+                comp_score += (f_score - req_f_score)
                 
             comp_score += tech_score
             
@@ -793,7 +812,11 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             if is_hyper_growth or has_momentum_privilege: comp_score += 1
             if '🦄' in catalyst: comp_score += 4  
             
-            # 合并 Reddit 与期权异动为“市场情绪因子”，取最大值而非叠加防共线性膨胀
+            # 【权重注入】：新加因子赋分
+            if rev_accel: comp_score += 2
+            if margin_exp: comp_score += 1
+            if inst_held > 0.20: comp_score += 1
+            
             options_bonus = 2 if '🔥' in options_flow else (1 if '⚠️' in options_flow else 0)
             hype_factor = max(reddit_score, options_bonus)
             comp_score += hype_factor
@@ -810,7 +833,6 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
             if '🩸' in squeeze_signal: comp_score += 2
             elif '⚠️' in squeeze_signal: comp_score += 1
 
-            # 【策略修正 4】：动态 ATR 乘数，防高波动小盘股洗盘误杀
             atr_pct = atr / close_price if close_price > 0 else 0
             base_atr_mult = 2.0 if atr_pct > 0.05 else Config.ATR_MULTIPLIER
             actual_atr_mult = (base_atr_mult * 0.7) if regime == 'YELLOW' else base_atr_mult
@@ -827,6 +849,14 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
                     raw_shares = int(max_position_value / close_price)
             else:
                 raw_shares = 0
+                
+            # 【输出打磨】：整理新增维度的推送文字
+            core_tags = []
+            if rev_accel: core_tags.append("🔥营收加速")
+            if margin_exp: core_tags.append("📈毛利扩张")
+            if inst_held > 0.20: core_tags.append(f"🏦机构持仓({inst_held:.1%})")
+            if has_momentum_privilege: core_tags.append("🛡️免检数据豁免")
+            core_str = " | ".join(core_tags) if core_tags else "基本面平稳"
 
             return {
                 '股票代码': symbol, '公司名称': info.get('longName', symbol),
@@ -835,7 +865,7 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
                 '催化剂': catalyst, '散户情绪': reddit_signal, '内幕交易': insider_trading, '轧空雷达': squeeze_signal,
                 '最新收盘价': round(close_price, 2), '止损价': round(stop_loss, 2),
                 '建议股数': raw_shares, 'F_Score_raw': f_score, 'gross_margin': gross_margin,
-                'revenue_growth_raw': revenue_growth, 'data_tag': data_tag, 'rule_of_40': rule_of_40
+                'revenue_growth_raw': revenue_growth, '核心质地': core_str, 'rule_of_40': rule_of_40
             }
         except Exception:
             if hasattr(thread_local, "session"):
@@ -848,7 +878,6 @@ def analyze_fundamentals(symbol, tech_info, regime, io_executor):
 # 自动复盘与主干逻辑
 # ==========================================
 def run_auto_backtest():
-    """【修正】：下载整月数据并检查期间最低价，消除前视生存者偏差"""
     try:
         if not os.path.exists('growth_hunter_signals.db'): return ""
         df_db = pd.read_sql_query("SELECT * FROM signals", sqlite3.connect('growth_hunter_signals.db'))
@@ -915,7 +944,7 @@ def send_notifications(df, sell_report="", backtest_report=""):
         
     summary += (f"【新增捕获】 {len(df)} 只底盘扎实且量价齐升的起爆股：\n\n" if not df.empty else "今日无新增达标买入标的。\n\n")
     for _, row in df.head(10).iterrows():
-        item = f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿) {row.get('data_tag', '')}\n  └ {row['筛选理由']}\n\n"
+        item = f"• [{row['股票代码']}] {row['公司名称']} ({row['市值(亿美元)']}亿)\n  └ {row['筛选理由']}\n\n"
         if len(summary) + len(item) > 3500: summary += "...（已自动截断）\n\n"; break
         summary += item
     summary += backtest_report
@@ -1012,6 +1041,7 @@ def main(dry_run=False, input_file=None):
                 
             reasons = (
                 f"R40法则: {row['rule_of_40']:.1f}% | 增速: {row['revenue_growth_raw']:.1%} | F-Score: {row['F_Score_raw']}/9\n"
+                f"  └ 💎 质地: {row['核心质地']}\n"
                 f"  └ 🛡️ 风控: 建议买入 {shares_str} | 破位止损 ${row['止损价']:.2f} | 预估动用 ${cost:.2f}\n"
                 f"  └ 🎲 另类: {row['期权异动']} | {row['散户情绪']}\n"
                 f"  └ 📰 消息: {row['催化剂']}\n"
@@ -1022,7 +1052,7 @@ def main(dry_run=False, input_file=None):
             final_selected.append(row)
             
         df = pd.DataFrame(final_selected)
-        df = df.drop(columns=['止损价', '建议股数', 'F_Score_raw', 'gross_margin', 'revenue_growth_raw', 'rule_of_40'], errors='ignore')
+        df = df.drop(columns=['止损价', '建议股数', 'F_Score_raw', 'gross_margin', 'revenue_growth_raw', 'rule_of_40', '核心质地'], errors='ignore')
 
         md_df = df.copy()
         md_df['股票代码'] = md_df['股票代码'].apply(lambda x: f"[{x}](https://finance.yahoo.com/quote/{x})")
