@@ -74,7 +74,11 @@ def calculate_indicators(df):
     # 计算布林带宽度 (Bandwidth) 识别挤压
     df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']
     
-    # 6. 支撑阻力：枢纽点 (Pivot Points)
+    # [新增] 6. 趋势强度：ADX (14)
+    adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+    df['ADX'] = adx.iloc[:, 0] # 提取 ADX 线以兼容不同版本的列名
+    
+    # 7. 支撑阻力：枢纽点 (Pivot Points)
     prev_high = df['high'].iloc[-2]
     prev_low = df['low'].iloc[-2]
     prev_close = df['close'].iloc[-2]
@@ -85,13 +89,14 @@ def calculate_indicators(df):
     return df
 
 def generate_report_prompt(df):
-    """生成包含MACD和布林带的增强版结构化分析提示词"""
+    """生成包含MACD、布林带和ADX的增强版结构化分析提示词"""
     latest = df.iloc[-1]
     
     current_price = latest['close']
     sma_20 = latest['SMA_20']
     rsi = latest['RSI_14']
     atr = latest['ATR_14']
+    adx = latest['ADX']  # [新增提取 ADX 数据]
     s1 = latest['S1']
     r1 = latest['R1']
     
@@ -105,6 +110,14 @@ def generate_report_prompt(df):
     bb_lower = latest['BB_Lower']
     bb_pos = (current_price - bb_lower) / (bb_upper - bb_lower) * 100 # 价格在带内的百分比位置
     
+    # [新增] 市场状态判定 (基于ADX)
+    if adx < 20:
+        market_state = "震荡市 (趋势极弱，高抛低吸为主)"
+    elif adx > 25:
+        market_state = "趋势市 (动能强劲，适合顺势突破)"
+    else:
+        market_state = "趋势酝酿中 (观察方向选择)"
+
     # 止损止盈
     sl_long = current_price - (1.5 * atr)
     tp_long = current_price + (2.5 * atr)
@@ -119,6 +132,7 @@ def generate_report_prompt(df):
 [动能指标 (Momentum)]
 - MACD (12,26,9): {macd_val:.2f} | 柱状图: {macd_hist:.2f} ({macd_status})
 - RSI (14): {rsi:.2f} ({'超买' if rsi > 70 else ('超卖' if rsi < 30 else '中性')})
+- 趋势强度 (ADX14): {adx:.2f} => {market_state}
 
 [结构与波动 (Structure & Volatility)]
 - 布林带位置: {bb_pos:.1f}% (0%=下轨, 100%=上轨)
@@ -133,9 +147,31 @@ def generate_report_prompt(df):
 
 [待AI处理任务]
 1. 观察MACD直方图是否正在缩短或增长，判断动能衰竭情况。
-2. 结合价格在布林带的位置与S1/R1，给出80字以内的专业入场建议。
+2. 过滤规则：如果目前处于震荡市(ADX<20)，请忽略所有MACD交叉信号，仅依靠布林带上下轨和S1/R1进行反转操作。
+3. 结合以上结构与数据，给出80字以内的专业入场建议。
     """
     return report
+
+def push_to_dingtalk(message):
+    """将生成的报告推送到钉钉自定义机器人"""
+    webhook = os.getenv("DINGTALK_WEBHOOK")
+    if not webhook:
+        print("未配置 DINGTALK_WEBHOOK 环境变量，跳过钉钉推送。")
+        return
+        
+    headers = {'Content-Type': 'application/json'}
+    payload = {
+        "msgtype": "text",
+        "text": {
+            "content": message
+        }
+    }
+    try:
+        response = requests.post(webhook, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        print("=> 钉钉消息推送成功！")
+    except Exception as e:
+        print(f"=> 钉钉推送失败: {e}")
 
 def main():
     try:
@@ -146,6 +182,9 @@ def main():
         report_prompt = generate_report_prompt(df)
         print("\n=== Phase 1 升级完成：新增MACD与布林带数据 ===")
         print(report_prompt)
+        
+        # 执行钉钉推送
+        push_to_dingtalk(report_prompt)
         
     except Exception as e:
         print(f"执行出错: {e}")
