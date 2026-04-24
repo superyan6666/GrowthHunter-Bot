@@ -20,7 +20,7 @@ jobs:
       with:
         # 直接升级至 3.12，彻底避开旧版本的依赖黑洞
         python-version: '3.12'
-        cache: 'pip'
+        # 移除了 cache: 'pip'，避免因为缺少 requirements.txt 导致报错
 
     - name: Install Dependencies
       run: |
