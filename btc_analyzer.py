@@ -47,7 +47,7 @@ def fetch_binance_data(symbol, timeframe, limit):
     raise Exception("所有币安 API 节点均拒绝连接或超时，请检查网络、IP 限制或稍后再试。")
 
 def calculate_indicators(df):
-    """计算核心技术指标（包含MACD与布林带）"""
+    """计算核心技术指标（包含MACD与布林带），使用列索引提取实现版本兼容"""
     # 1. 趋势：20周期均线
     df['SMA_20'] = ta.sma(df['close'], length=20)
     
@@ -59,16 +59,18 @@ def calculate_indicators(df):
     
     # 4. MACD (12, 26, 9)
     macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-    # 分别提取 MACD线, 信号线, 直方图
-    df['MACD'] = macd['MACD_12_26_9']
-    df['MACD_Signal'] = macd['MACDs_12_26_9']
-    df['MACD_Hist'] = macd['MACDh_12_26_9']
+    # 使用位置提取防列名不一致: 0=MACD线, 1=直方图, 2=信号线
+    df['MACD'] = macd.iloc[:, 0]
+    df['MACD_Hist'] = macd.iloc[:, 1]
+    df['MACD_Signal'] = macd.iloc[:, 2]
     
     # 5. 布林带 (20, 2)
     bbands = ta.bbands(df['close'], length=20, std=2)
-    df['BB_Upper'] = bbands['BBU_20_2.0']
-    df['BB_Middle'] = bbands['BBM_20_2.0']
-    df['BB_Lower'] = bbands['BBL_20_2.0']
+    # 使用位置提取防列名不一致: 0=下轨, 1=中轨, 2=上轨
+    df['BB_Lower'] = bbands.iloc[:, 0]
+    df['BB_Middle'] = bbands.iloc[:, 1]
+    df['BB_Upper'] = bbands.iloc[:, 2]
+    
     # 计算布林带宽度 (Bandwidth) 识别挤压
     df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']
     
