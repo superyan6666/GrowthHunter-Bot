@@ -2,9 +2,9 @@ name: BTC 15m Analyzer Scheduler
 
 on:
   schedule:
-    # 每 15 分钟触发一次 (若改为1小时，可使用 '0 * * * *')
+    # 每 15 分钟触发一次
     - cron: '*/15 * * * *'
-  # 允许手动在 GitHub 页面点击触发
+  # 允许手动在 GitHub 页面点击触发 (Workflow Dispatch)
   workflow_dispatch: 
 
 jobs:
@@ -18,17 +18,20 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.10'
+        # 直接升级至 3.12，彻底避开旧版本的依赖黑洞
+        python-version: '3.12'
+        cache: 'pip'
 
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests pandas pandas-ta
+        # 预先安装底层库以防止 pandas-ta 找不到前置依赖
+        pip install requests numpy pandas
+        # 安装核心计算库
+        pip install pandas-ta
 
     - name: Run BTC Analyzer Script
       run: python btc_analyzer.py
-      # 环境变量预留：
+      # 环境变量预留（Phase 2 使用）：
       # env:
       #   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      #   TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      #   TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
