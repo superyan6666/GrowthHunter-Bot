@@ -32,6 +32,9 @@ jobs:
 
     - name: Run BTC Analyzer Script
       run: python btc_analyzer.py
-      # 环境变量预留（Phase 2 使用）：
-      # env:
-      #   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      env:
+        # 挂载钉钉 Webhook 环境变量与触发关键词
+        DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+        DINGTALK_KEYWORD: 'AI'
+        # 环境变量预留（Phase 2 接入大模型使用）：
+        # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
