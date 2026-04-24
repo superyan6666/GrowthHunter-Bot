@@ -29,7 +29,7 @@ def fetch_binance_data(symbol, timeframe, limit):
     return df
 
 def calculate_indicators(df):
-    """计算核心技术指标（严格数学计算，拒绝AI幻觉）"""
+    """计算核心技术指标（包含MACD与布林带）"""
     # 1. 趋势：20周期均线
     df['SMA_20'] = ta.sma(df['close'], length=20)
     
@@ -39,11 +39,25 @@ def calculate_indicators(df):
     # 3. 波动率：ATR (用于计算止损)
     df['ATR_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     
-    # 4. 支撑阻力：传统枢纽点 (Pivot Points) 基于前一根K线
+    # 4. MACD (12, 26, 9)
+    macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+    # 分别提取 MACD线, 信号线, 直方图
+    df['MACD'] = macd['MACD_12_26_9']
+    df['MACD_Signal'] = macd['MACDs_12_26_9']
+    df['MACD_Hist'] = macd['MACDh_12_26_9']
+    
+    # 5. 布林带 (20, 2)
+    bbands = ta.bbands(df['close'], length=20, std=2)
+    df['BB_Upper'] = bbands['BBU_20_2.0']
+    df['BB_Middle'] = bbands['BBM_20_2.0']
+    df['BB_Lower'] = bbands['BBL_20_2.0']
+    # 计算布林带宽度 (Bandwidth) 识别挤压
+    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']
+    
+    # 6. 支撑阻力：枢纽点 (Pivot Points)
     prev_high = df['high'].iloc[-2]
     prev_low = df['low'].iloc[-2]
     prev_close = df['close'].iloc[-2]
-    
     pivot = (prev_high + prev_low + prev_close) / 3
     df['R1'] = (2 * pivot) - prev_low
     df['S1'] = (2 * pivot) - prev_high
@@ -51,7 +65,7 @@ def calculate_indicators(df):
     return df
 
 def generate_report_prompt(df):
-    """生成结构化的分析提示词（提供给LLM或直接推送到Telegram）"""
+    """生成包含MACD和布林带的增强版结构化分析提示词"""
     latest = df.iloc[-1]
     
     current_price = latest['close']
@@ -61,51 +75,57 @@ def generate_report_prompt(df):
     s1 = latest['S1']
     r1 = latest['R1']
     
-    # 机械止损止盈位计算 (例如：止损 1.5 ATR，止盈 2.5 ATR)
+    # MACD 数据
+    macd_val = latest['MACD']
+    macd_hist = latest['MACD_Hist']
+    macd_status = "金叉/多头增强" if macd_hist > 0 else "死叉/空头增强"
+    
+    # 布林带数据
+    bb_upper = latest['BB_Upper']
+    bb_lower = latest['BB_Lower']
+    bb_pos = (current_price - bb_lower) / (bb_upper - bb_lower) * 100 # 价格在带内的百分比位置
+    
+    # 止损止盈
     sl_long = current_price - (1.5 * atr)
     tp_long = current_price + (2.5 * atr)
-    
-    # 趋势判定
-    trend = "多头" if current_price > sma_20 else "空头"
-    rsi_status = "超买" if rsi > 70 else ("超卖" if rsi < 30 else "中性")
     
     time_str = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     
     report = f"""
-【BTC {TIMEFRAME} 级别市场微观扫描】
+【BTC {TIMEFRAME} 核心动能与结构扫描】
 时间: {time_str}
 当前价格: {current_price:.2f}
 
-[纯量化数据面板]
-- 短期趋势 (SMA20): {trend} ({sma_20:.2f})
-- 动量状态 (RSI14): {rsi_status} ({rsi:.2f})
-- 下方支撑 (S1): {s1:.2f}
-- 上方阻力 (R1): {r1:.2f}
-- 波动率 (ATR14): {atr:.2f}
+[动能指标 (Momentum)]
+- MACD (12,26,9): {macd_val:.2f} | 柱状图: {macd_hist:.2f} ({macd_status})
+- RSI (14): {rsi:.2f} ({'超买' if rsi > 70 else ('超卖' if rsi < 30 else '中性')})
 
-[系统测算机械风控 (仅供多头参考)]
-- 建议买入区: 接近 {s1:.2f}
-- 严格止损 (SL): {sl_long:.2f} (1.5 ATR)
-- 预期止盈 (TP): {tp_long:.2f} (2.5 ATR)
+[结构与波动 (Structure & Volatility)]
+- 布林带位置: {bb_pos:.1f}% (0%=下轨, 100%=上轨)
+- 布林带区间: [{bb_lower:.2f} - {bb_upper:.2f}]
+- 枢纽点 S1/R1: {s1:.2f} / {r1:.2f}
+- 波动率 ATR: {atr:.2f}
 
-[待AI处理的任务]
-请根据以上硬指标，结合当前是否在支撑/阻力位附近，给出一段80字以内的专业交易决策建议，包括是否适合此时入场。
+[系统测算风控]
+- 建议买入参考: {max(s1, bb_lower):.2f} (结合支撑与布林下轨)
+- 机械止损 (SL): {sl_long:.2f}
+- 目标止盈 (TP): {tp_long:.2f}
+
+[待AI处理任务]
+1. 观察MACD直方图是否正在缩短或增长，判断动能衰竭情况。
+2. 结合价格在布林带的位置与S1/R1，给出80字以内的专业入场建议。
     """
     return report
 
 def main():
     try:
-        print(f"正在拉取 {SYMBOL} {TIMEFRAME} 数据...")
+        print(f"正在拉取 {SYMBOL} {TIMEFRAME} 数据并计算增强指标...")
         df = fetch_binance_data(SYMBOL, TIMEFRAME, LIMIT)
         df = calculate_indicators(df)
         
-        # 获取基础报告框架
         report_prompt = generate_report_prompt(df)
-        print("\n=== Phase 1 跑通：生成基础分析框架 ===")
+        print("\n=== Phase 1 升级完成：新增MACD与布林带数据 ===")
         print(report_prompt)
-        
-        # 此处预留 Webhook 推送代码 (如 Telegram/Discord)
-        # 预留 Phase 2 的 LLM API 调用代码
         
     except Exception as e:
         print(f"执行出错: {e}")
