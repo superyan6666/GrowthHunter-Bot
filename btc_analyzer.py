@@ -10,23 +10,41 @@ TIMEFRAME = "15m"  # 可随时改为 "1h"
 LIMIT = 100        # 获取前100根K线足够计算常用指标
 
 def fetch_binance_data(symbol, timeframe, limit):
-    """通过币安公共API获取K线数据"""
-    url = f"https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": timeframe, "limit": limit}
-    response = requests.get(url, params=params)
-    response.raise_for_status()
+    """通过币安公共API获取K线数据，带防屏蔽回退机制"""
+    # 采用官方数据专用节点与主节点备用机制，绕过美国IP的451封锁
+    endpoints = [
+        "https://data-api.binance.vision/api/v3/klines",  # 优先：公共数据节点，对受限区域更友好
+        "https://api1.binance.com/api/v3/klines",         # 备选节点 1
+        "https://api.binance.com/api/v3/klines"           # 备选节点 2
+    ]
     
-    data = response.json()
-    df = pd.DataFrame(data, columns=[
-        'timestamp', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'number_of_trades',
-        'taker_buy_base_asset', 'taker_buy_quote_asset', 'ignore'
-    ])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    # 转换数值类型
-    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric)
-    return df
+    params = {"symbol": symbol, "interval": timeframe, "limit": limit}
+    
+    for url in endpoints:
+        try:
+            # 增加 timeout 防止卡死
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status() # 如果返回非 200 状态码，会抛出 HTTPError
+            
+            data = response.json()
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'number_of_trades',
+                'taker_buy_base_asset', 'taker_buy_quote_asset', 'ignore'
+            ])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            # 转换数值类型
+            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric)
+            return df
+            
+        except requests.exceptions.RequestException as e:
+            # 静默捕捉异常并尝试下一个节点（仅保留简单调试输出以供查阅日志）
+            print(f"节点 {url} 报错: {e}，尝试切换备用节点...")
+            continue
+            
+    # 如果所有节点都失败，则终止程序
+    raise Exception("所有币安 API 节点均拒绝连接或超时，请检查网络、IP 限制或稍后再试。")
 
 def calculate_indicators(df):
     """计算核心技术指标（包含MACD与布林带）"""
