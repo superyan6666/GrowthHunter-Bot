@@ -30,3 +30,8 @@ jobs:
       env:
         DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
         DINGTALK_KEYWORD: 'AI'
+        
+        # [Phase 2 核心] LLM 架构解耦配置项，实现底层服务提供商无缝热切换
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }} # 可在 Secrets 中配置第三方兼容代理，如 https://api.deepseek.com/v1
+        LLM_MODEL: ${{ vars.LLM_MODEL }} # 存放在 GitHub Variables 中方便随时修改，如 deepseek-chat 或 gpt-4o-mini
