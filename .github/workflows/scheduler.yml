@@ -31,7 +31,8 @@ jobs:
         pip install pandas-ta
 
     - name: Run BTC Analyzer Script
-      run: python btc_analyzer.py
+      # 加上 -u 参数，强制 Python 禁用输出缓冲，确保日志实时打印到 GitHub 控制台
+      run: python -u btc_analyzer.py
       env:
         # 挂载钉钉 Webhook 环境变量与触发关键词
         DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
