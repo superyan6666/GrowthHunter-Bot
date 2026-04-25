@@ -7,8 +7,8 @@ import time
 import json
 
 # ================= 核心配置 =================
-SYMBOL = "BTCUSDT"       
-TIMEFRAME = "15m"        
+SYMBOL = "BTC/USD"       # [已修改] Alpaca 的交易对格式
+TIMEFRAME = "15Min"      # [已修改] Alpaca 的时间周期格式
 LIMIT = 500        
 RR_RATIO = 2.0     
 ACCOUNT_BALANCE = 10000  
@@ -56,44 +56,52 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=4)
 
-def fetch_bitget_data(symbol, timeframe, limit):
-    """通过 Bitget V2 公共 API 获取 K 线数据 (抗封锁最优解)"""
-    url = "https://api.bitget.com/api/v2/spot/market/candles"
-    # Bitget 要求的参数是 15min, 1h 等，此处做兼容转换
-    bg_timeframe = timeframe.replace('m', 'min') if timeframe.endswith('m') else timeframe
-    params = {"symbol": symbol, "granularity": bg_timeframe, "limit": limit}
+def fetch_alpaca_data(symbol, timeframe, limit):
+    """[已切换] 通过 Alpaca Crypto API 获取 K 线数据"""
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    
+    if not api_key or not secret_key:
+        raise Exception("未配置 ALPACA_API_KEY 或 ALPACA_SECRET_KEY 环境变量。")
+        
+    url = "https://data.alpaca.markets/v1beta3/crypto/us/bars"
+    headers = {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": secret_key,
+        "accept": "application/json"
+    }
+    params = {
+        "symbols": symbol,
+        "timeframe": timeframe,
+        "limit": limit
+    }
     
     for attempt in range(3):
         try:
             if attempt > 0:
                 time.sleep(2 ** attempt)
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, headers=headers, params=params, timeout=10)
             response.raise_for_status() 
             data = response.json()
             
-            if str(data.get("code")) != "00000":
-                raise Exception(f"Bitget API 返回错误: {data.get('msg')}")
-                
-            bars = data.get("data", [])
+            bars = data.get("bars", {}).get(symbol, [])
             if not bars:
-                raise Exception("Bitget 返回数据为空")
+                raise Exception("Alpaca 返回数据为空")
                 
-            # 关键修复：先将其转化为 DataFrame，再截取前 6 列（防止 API 偷偷增加第8、9列）
+            # 解析 Alpaca 数据格式: t, o, h, l, c, v
             df = pd.DataFrame(bars)
-            df = df.iloc[:, :6] # 只保留 [ts, open, high, low, close, base_vol]
-            df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-            
-            df['timestamp'] = pd.to_datetime(pd.to_numeric(df['timestamp']), unit='ms')
+            df.rename(columns={'t': 'timestamp', 'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
             df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
             
-            # 关键修复：翻转倒序数组
+            # 确保按时间正序排列
             df = df.sort_values('timestamp').reset_index(drop=True)
             return df
         except Exception as e:
-            print(f"Bitget API 尝试 {attempt+1} 失败: {e}")
+            print(f"Alpaca API 尝试 {attempt+1} 失败: {e}")
             continue
             
-    raise Exception("Bitget API 连续连接失败，请检查网络。")
+    raise Exception("Alpaca API 连续连接失败，请检查网络或 API Key 权限。")
 
 def calculate_indicators(df):
     """计算核心技术指标"""
@@ -243,7 +251,7 @@ def push_to_dingtalk(message):
         print(f"钉钉推送失败: {e}")
 
 def run_logic():
-    df = fetch_bitget_data(SYMBOL, TIMEFRAME, LIMIT)
+    df = fetch_alpaca_data(SYMBOL, TIMEFRAME, LIMIT)
     df = calculate_indicators(df)
     
     if os.getenv("OPENAI_API_KEY"):
