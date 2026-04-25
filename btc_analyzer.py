@@ -115,6 +115,11 @@ def calculate_indicators(df):
     df['BB_Lower'] = bbands[[c for c in bbands.columns if c.startswith('BBL')][0]]
     df['BB_Middle'] = bbands[[c for c in bbands.columns if c.startswith('BBM')][0]]
     df['BB_Upper'] = bbands[[c for c in bbands.columns if c.startswith('BBU')][0]]
+    
+    # [新增] 测算布林带宽度与近50周期极小值，用于识别变盘收敛模式
+    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']
+    df['BB_Width_Min_50'] = df['BB_Width'].rolling(window=50).min()
+    
     adx = ta.adx(df['high'], df['low'], df['close'], length=14)
     df['ADX'] = adx['ADX_14']
     prev = df.iloc[-2]
@@ -182,28 +187,58 @@ def call_llm_decision(context_json):
         return {"action": "HOLD", "confidence": 0.0, "reason": f"AI服务调用异常，安全降级观望。({str(e)})"}
 
 def get_internal_signal(df):
-    """当无 AI Key 时接管的内部硬逻辑引擎"""
+    """[深度优化] 引入市场状态机与背离检测的硬逻辑引擎"""
     latest, prev = df.iloc[-1], df.iloc[-2]
     current_price = latest['close']
     adx, ema_200, vol_sma_20 = latest['ADX'], latest['EMA_200'], latest['Vol_SMA_20']
     
-    if pd.isna(adx) or pd.isna(ema_200): return {"action": "HOLD", "reason": "数据不足，持续观望"}
+    if pd.isna(adx) or pd.isna(ema_200) or pd.isna(latest['BB_Width_Min_50']): 
+        return {"action": "HOLD", "reason": "数据预热中，持续观望"}
     
     macd_cross_up = latest['MACD_Hist'] > prev['MACD_Hist']
     macd_cross_down = latest['MACD_Hist'] < prev['MACD_Hist']
     vol_ratio = latest['volume'] / vol_sma_20 if vol_sma_20 > 0 else 0
-    rsi, s1, r1 = latest['RSI_14'], latest['S1'], latest['R1']
+    rsi = latest['RSI_14']
     
-    if adx < 20:
-        if current_price <= s1 * 1.002 and rsi < 30: return {"action": "BUY", "reason": "[内部信号] 震荡市触底S1且RSI超卖"}
-        elif current_price >= r1 * 0.998 and rsi > 70: return {"action": "SELL", "reason": "[内部信号] 震荡市触顶R1且RSI超买"}
-    elif adx > 25:
-        if current_price > ema_200 and macd_cross_up and vol_ratio > 1.2 and current_price <= latest['BB_Middle']:
-            return {"action": "BUY", "reason": "[内部信号] 牛市基调+动能转正+放量"}
-        elif current_price < ema_200 and macd_cross_down and vol_ratio > 1.2 and current_price >= latest['BB_Middle']:
-            return {"action": "SELL", "reason": "[内部信号] 熊市基调+动能转负+放量"}
+    # === 模式 S: 顶/底背离检测 (MACD 动能背离反转) ===
+    recent_20 = df.iloc[-21:-1] # 提取过去20根闭合K线
+    min_idx, max_idx = recent_20['close'].idxmin(), recent_20['close'].idxmax()
+    
+    # 底背离: 价格破前低，但 MACD 柱图明显抬高，且当前动能拐头向上
+    if current_price < df.loc[min_idx, 'close'] and latest['MACD_Hist'] > df.loc[min_idx, 'MACD_Hist'] and macd_cross_up:
+        return {"action": "BUY", "reason": "[自适应: 底背离反转] 价格创新低但MACD动能抬高"}
+
+    # 顶背离: 价格破前高，但 MACD 柱图明显降低，且当前动能拐头向下
+    if current_price > df.loc[max_idx, 'close'] and latest['MACD_Hist'] < df.loc[max_idx, 'MACD_Hist'] and macd_cross_down:
+        return {"action": "SELL", "reason": "[自适应: 顶背离反转] 价格创新高但MACD动能衰竭"}
+        
+    # === 模式 A: 极度收敛 (变盘前夕高赔率突破) ===
+    # 当前宽度极窄（接近50周期最低点）
+    is_squeeze = latest['BB_Width'] <= latest['BB_Width_Min_50'] * 1.10
+    if is_squeeze:
+        if current_price > latest['BB_Upper'] and vol_ratio > 1.5:
+            return {"action": "BUY", "reason": "[自适应: 变盘爆发] 布林带极度收敛后放量向上突破"}
+        elif current_price < latest['BB_Lower'] and vol_ratio > 1.5:
+            return {"action": "SELL", "reason": "[自适应: 变盘爆发] 布林带极度收敛后放量向下破位"}
+        return {"action": "HOLD", "reason": "[自适应: 极度收敛] 暴风雨前的宁静，等待放量确认"}
+
+    # === 模式 B: 单边趋势市 (ADX > 25) ===
+    if adx > 25:
+        if current_price > ema_200 and macd_cross_up and vol_ratio > 1.2:
+            if current_price <= latest['BB_Upper']: # 防追高
+                return {"action": "BUY", "reason": "[自适应: 单边牛市] 回踩安全区，动能转正+放量"}
+        elif current_price < ema_200 and macd_cross_down and vol_ratio > 1.2:
+            if current_price >= latest['BB_Lower']: # 防追空
+                return {"action": "SELL", "reason": "[自适应: 单边熊市] 反抽阻力区，动能转负+放量"}
+                
+    # === 模式 C: 震荡市均值回归 (ADX < 20) ===
+    elif adx < 20:
+        if current_price <= latest['BB_Lower'] and rsi < 35: 
+            return {"action": "BUY", "reason": "[自适应: 震荡均值回归] 触及下轨且RSI超卖"}
+        elif current_price >= latest['BB_Upper'] and rsi > 65: 
+            return {"action": "SELL", "reason": "[自适应: 震荡均值回归] 触及上轨且RSI超买"}
             
-    return {"action": "HOLD", "reason": "无明显高胜率结构，保持观望"}
+    return {"action": "HOLD", "reason": "[自适应: 混沌期] 无高胜率结构，保持观望"}
 
 def format_final_report(df, final_action, reason, alert_prefix):
     latest = df.iloc[-1]
