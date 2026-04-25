@@ -7,8 +7,8 @@ import time
 import json
 
 # ================= 核心配置 =================
-SYMBOL = "BTC/USD"       # [已修改] Alpaca 的交易对格式
-TIMEFRAME = "15Min"      # [已修改] Alpaca 的时间周期格式
+SYMBOL = "BTC/USD"       # Alpaca 的交易对格式
+TIMEFRAME = "15Min"      # Alpaca 的时间周期格式
 LIMIT = 500        
 RR_RATIO = 2.0     
 ACCOUNT_BALANCE = 10000  
@@ -57,7 +57,7 @@ def save_state(state):
         json.dump(state, f, indent=4)
 
 def fetch_alpaca_data(symbol, timeframe, limit):
-    """[已切换] 通过 Alpaca Crypto API 获取 K 线数据"""
+    """通过 Alpaca Crypto API 获取 K 线数据"""
     api_key = os.getenv("ALPACA_API_KEY")
     secret_key = os.getenv("ALPACA_SECRET_KEY")
     
@@ -88,46 +88,55 @@ def fetch_alpaca_data(symbol, timeframe, limit):
             if not bars:
                 raise Exception("Alpaca 返回数据为空")
                 
-            # 解析 Alpaca 数据格式: t, o, h, l, c, v
             df = pd.DataFrame(bars)
             df.rename(columns={'t': 'timestamp', 'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'}, inplace=True)
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
             
-            # 确保按时间正序排列
             df = df.sort_values('timestamp').reset_index(drop=True)
             return df
         except Exception as e:
             print(f"Alpaca API 尝试 {attempt+1} 失败: {e}")
             continue
             
-    raise Exception("Alpaca API 连续连接失败，请检查网络或 API Key 权限。")
+    raise Exception("Alpaca API 连续连接失败。")
 
 def calculate_indicators(df):
     """计算核心技术指标"""
     df['SMA_20'] = ta.sma(df['close'], length=20)
     df['RSI_14'] = ta.rsi(df['close'], length=14)
     df['ATR_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    
+    # MACD
     macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
     df['MACD'] = macd['MACD_12_26_9']
     df['MACD_Hist'] = macd['MACDh_12_26_9']
+    
+    # 布林带
     bbands = ta.bbands(df['close'], length=20, std=2)
     df['BB_Lower'] = bbands[[c for c in bbands.columns if c.startswith('BBL')][0]]
     df['BB_Middle'] = bbands[[c for c in bbands.columns if c.startswith('BBM')][0]]
     df['BB_Upper'] = bbands[[c for c in bbands.columns if c.startswith('BBU')][0]]
     
-    # [新增] 测算布林带宽度与近50周期极小值，用于识别变盘收敛模式
+    # 变盘检测指标
     df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']
     df['BB_Width_Min_50'] = df['BB_Width'].rolling(window=50).min()
     
+    # 趋势强度
     adx = ta.adx(df['high'], df['low'], df['close'], length=14)
     df['ADX'] = adx['ADX_14']
+    
+    # [MTF 优化] 引入大周期模拟 (EMA144 约等于 1H 级别的 EMA36)
+    df['EMA_HTF_Proxy'] = ta.ema(df['close'], length=144)
+    df['EMA_200'] = ta.ema(df['close'], length=200)
+    
+    # 支撑阻力
     prev = df.iloc[-2]
     pivot = (prev['high'] + prev['low'] + prev['close']) / 3
     df['R1'] = (2 * pivot) - prev['low']
     df['S1'] = (2 * pivot) - prev['high']
     df['Vol_SMA_20'] = ta.sma(df['volume'], length=20)
-    df['EMA_200'] = ta.ema(df['close'], length=200)
+    
     return df
 
 def safe_fmt(value, fmt="{:.2f}"):
@@ -142,35 +151,27 @@ def build_ai_context(df):
         "timeframe": TIMEFRAME,
         "current_price": latest['close'], 
         "macro_trend_ema200": latest['EMA_200'] if not pd.isna(latest['EMA_200']) else None,
+        "htf_trend_proxy": latest['EMA_HTF_Proxy'] if not pd.isna(latest['EMA_HTF_Proxy']) else None,
         "trend_strength_adx14": latest['ADX'] if not pd.isna(latest['ADX']) else None,
         "volatility_atr14": latest['ATR_14'] if not pd.isna(latest['ATR_14']) else None,
-        "support_s1": latest['S1'] if not pd.isna(latest['S1']) else None,
-        "resistance_r1": latest['R1'] if not pd.isna(latest['R1']) else None,
-        "bbands_lower": latest['BB_Lower'],
-        "bbands_upper": latest['BB_Upper'],
-        "vol_sma_20": latest['Vol_SMA_20'] if not pd.isna(latest['Vol_SMA_20']) else None,
         "recent_5_candles": recent_5
     }
     return json.dumps(context, ensure_ascii=False)
 
 def call_llm_decision(context_json):
-    """调用大模型决策并强制返回规范 JSON"""
+    """调用大模型决策"""
     api_key = os.getenv("OPENAI_API_KEY")
     api_base = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1") 
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    system_prompt = """你是一个顶级的量化加密货币交易AI。我将提供包含最新技术指标和最近5根K线序列的JSON数据。
-请严格遵守以下JSON格式输出，禁止任何多余文本：
-{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0到1.0的浮点数, "reason": "80字以内的专业分析理由"}
-防画门规则：若成交量萎缩或在ADX<20时出现伪突破，请务必返回HOLD。"""
+    system_prompt = """你是一个顶级的加密货币交易AI。请根据技术指标和K线序列做出判断。
+必须以JSON格式输出：{"action": "BUY"|"SELL"|"HOLD", "confidence": 0.0-1.0, "reason": "分析理由"}
+重点：关注大周期趋势共振和底背离形态。"""
 
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": context_json}
-        ],
+        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": context_json}],
         "response_format": {"type": "json_object"},
         "temperature": 0.2
     }
@@ -179,101 +180,96 @@ def call_llm_decision(context_json):
         response = requests.post(f"{api_base}/chat/completions", headers=headers, json=payload, timeout=20)
         response.raise_for_status()
         decision = json.loads(response.json()['choices'][0]['message']['content'])
-        action = decision.get("action", "HOLD").upper()
-        if action not in ["BUY", "SELL", "HOLD"]: action = "HOLD"
-        return {"action": action, "confidence": float(decision.get("confidence", 0.0)), "reason": decision.get("reason", "未提供理由")}
+        return {"action": decision.get("action", "HOLD").upper(), "confidence": float(decision.get("confidence", 0.0)), "reason": decision.get("reason", "")}
     except Exception as e:
         print(f"LLM API 异常: {e}")
-        return {"action": "HOLD", "confidence": 0.0, "reason": f"AI服务调用异常，安全降级观望。({str(e)})"}
+        return {"action": "HOLD", "confidence": 0.0, "reason": "AI请求失败，降级。"}
 
 def get_internal_signal(df):
-    """[深度优化] 引入市场状态机与背离检测的硬逻辑引擎"""
+    """[深度重构] 包含状态机、背离检测及 MTF 共振的决策引擎"""
     latest, prev = df.iloc[-1], df.iloc[-2]
     current_price = latest['close']
-    adx, ema_200, vol_sma_20 = latest['ADX'], latest['EMA_200'], latest['Vol_SMA_20']
+    adx, ema_200, ema_htf = latest['ADX'], latest['EMA_200'], latest['EMA_HTF_Proxy']
     
-    if pd.isna(adx) or pd.isna(ema_200) or pd.isna(latest['BB_Width_Min_50']): 
-        return {"action": "HOLD", "reason": "数据预热中，持续观望"}
+    if pd.isna(adx) or pd.isna(ema_htf): 
+        return {"action": "HOLD", "reason": "数据预热中"}
     
-    macd_cross_up = latest['MACD_Hist'] > prev['MACD_Hist']
-    macd_cross_down = latest['MACD_Hist'] < prev['MACD_Hist']
-    vol_ratio = latest['volume'] / vol_sma_20 if vol_sma_20 > 0 else 0
+    macd_hist = latest['MACD_Hist']
+    macd_cross_up = macd_hist > prev['MACD_Hist']
+    macd_cross_down = macd_hist < prev['MACD_Hist']
+    vol_ratio = latest['volume'] / latest['Vol_SMA_20'] if latest['Vol_SMA_20'] > 0 else 0
     rsi = latest['RSI_14']
     
-    # === 模式 S: 顶/底背离检测 (MACD 动能背离反转) ===
-    recent_20 = df.iloc[-21:-1] # 提取过去20根闭合K线
+    # 大周期背景颜色 (MTF 滤网)
+    is_htf_bull = current_price > ema_htf
+    is_htf_bear = current_price < ema_htf
+
+    # === 模式 S: 顶/底背离检测 (最高优先级) ===
+    recent_20 = df.iloc[-21:-1]
     min_idx, max_idx = recent_20['close'].idxmin(), recent_20['close'].idxmax()
     
-    # 底背离: 价格破前低，但 MACD 柱图明显抬高，且当前动能拐头向上
-    if current_price < df.loc[min_idx, 'close'] and latest['MACD_Hist'] > df.loc[min_idx, 'MACD_Hist'] and macd_cross_up:
-        return {"action": "BUY", "reason": "[自适应: 底背离反转] 价格创新低但MACD动能抬高"}
+    # 底背离: 价格创新低但动能抬高 + 大周期不处于极端空头
+    if current_price < df.loc[min_idx, 'close'] and macd_hist > df.loc[min_idx, 'MACD_Hist'] and macd_cross_up:
+        if not (is_htf_bear and adx > 40): # 拒绝在大单边跌势中摸底
+            return {"action": "BUY", "reason": "[MTF: 底背离反转] 动能衰竭且大周期支撑"}
 
-    # 顶背离: 价格破前高，但 MACD 柱图明显降低，且当前动能拐头向下
-    if current_price > df.loc[max_idx, 'close'] and latest['MACD_Hist'] < df.loc[max_idx, 'MACD_Hist'] and macd_cross_down:
-        return {"action": "SELL", "reason": "[自适应: 顶背离反转] 价格创新高但MACD动能衰竭"}
+    # 顶背离
+    if current_price > df.loc[max_idx, 'close'] and macd_hist < df.loc[max_idx, 'MACD_Hist'] and macd_cross_down:
+        if not (is_htf_bull and adx > 40):
+            return {"action": "SELL", "reason": "[MTF: 顶背离反转] 动能衰竭且大周期见顶"}
         
-    # === 模式 A: 极度收敛 (变盘前夕高赔率突破) ===
-    # 当前宽度极窄（接近50周期最低点）
+    # === 模式 A: 极度收敛 (变盘共振) ===
     is_squeeze = latest['BB_Width'] <= latest['BB_Width_Min_50'] * 1.10
     if is_squeeze:
-        if current_price > latest['BB_Upper'] and vol_ratio > 1.5:
-            return {"action": "BUY", "reason": "[自适应: 变盘爆发] 布林带极度收敛后放量向上突破"}
-        elif current_price < latest['BB_Lower'] and vol_ratio > 1.5:
-            return {"action": "SELL", "reason": "[自适应: 变盘爆发] 布林带极度收敛后放量向下破位"}
-        return {"action": "HOLD", "reason": "[自适应: 极度收敛] 暴风雨前的宁静，等待放量确认"}
+        if current_price > latest['BB_Upper'] and vol_ratio > 1.5 and is_htf_bull:
+            return {"action": "BUY", "reason": "[MTF: 共振爆发] 布林带收敛后随大趋势向上突破"}
+        elif current_price < latest['BB_Lower'] and vol_ratio > 1.5 and is_htf_bear:
+            return {"action": "SELL", "reason": "[MTF: 共振爆发] 布林带收敛后随大趋势向下破位"}
 
-    # === 模式 B: 单边趋势市 (ADX > 25) ===
+    # === 模式 B: 单边趋势市 ===
     if adx > 25:
-        if current_price > ema_200 and macd_cross_up and vol_ratio > 1.2:
-            if current_price <= latest['BB_Upper']: # 防追高
-                return {"action": "BUY", "reason": "[自适应: 单边牛市] 回踩安全区，动能转正+放量"}
-        elif current_price < ema_200 and macd_cross_down and vol_ratio > 1.2:
-            if current_price >= latest['BB_Lower']: # 防追空
-                return {"action": "SELL", "reason": "[自适应: 单边熊市] 反抽阻力区，动能转负+放量"}
+        if is_htf_bull and current_price > ema_200 and macd_cross_up and vol_ratio > 1.1:
+            return {"action": "BUY", "reason": "[MTF: 趋势共振] 双周期牛市+回踩买入"}
+        elif is_htf_bear and current_price < ema_200 and macd_cross_down and vol_ratio > 1.1:
+            return {"action": "SELL", "reason": "[MTF: 趋势共振] 双周期熊市+反抽卖出"}
                 
-    # === 模式 C: 震荡市均值回归 (ADX < 20) ===
+    # === 模式 C: 震荡市均值回归 ===
     elif adx < 20:
-        if current_price <= latest['BB_Lower'] and rsi < 35: 
-            return {"action": "BUY", "reason": "[自适应: 震荡均值回归] 触及下轨且RSI超卖"}
-        elif current_price >= latest['BB_Upper'] and rsi > 65: 
-            return {"action": "SELL", "reason": "[自适应: 震荡均值回归] 触及上轨且RSI超买"}
+        if current_price <= latest['BB_Lower'] and rsi < 30: return {"action": "BUY", "reason": "[自适应: 震荡] 下轨超卖"}
+        elif current_price >= latest['BB_Upper'] and rsi > 70: return {"action": "SELL", "reason": "[自适应: 震荡] 上轨超买"}
             
-    return {"action": "HOLD", "reason": "[自适应: 混沌期] 无高胜率结构，保持观望"}
+    return {"action": "HOLD", "reason": "市场处于混沌波动，无共振信号"}
 
 def format_final_report(df, final_action, reason, alert_prefix):
     latest = df.iloc[-1]
-    current_price = latest['close']
-    atr = latest['ATR_14']
+    current_price, atr = latest['close'], latest['ATR_14']
     
     if not pd.isna(atr) and atr > 0:
         sl_dist = 1.5 * atr
-        pos_size_btc_val = (ACCOUNT_BALANCE * RISK_PER_TRADE) / sl_dist
-        sl_long_str = safe_fmt(current_price - sl_dist)
-        tp_long_str = safe_fmt(current_price + (sl_dist * RR_RATIO))
-        sl_short_str = safe_fmt(current_price + sl_dist)
-        tp_short_str = safe_fmt(current_price - (sl_dist * RR_RATIO))
+        pos_size = (ACCOUNT_BALANCE * RISK_PER_TRADE) / sl_dist
+        sl_long, tp_long = current_price - sl_dist, current_price + (sl_dist * RR_RATIO)
+        sl_short, tp_short = current_price + sl_dist, current_price - (sl_dist * RR_RATIO)
     else:
-        pos_size_btc_val = 0
-        sl_long_str = tp_long_str = sl_short_str = tp_short_str = "数据不足"
+        pos_size = 0
+        sl_long = tp_long = sl_short = tp_short = 0
 
     time_str = datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
-    action_icon = {"BUY": "🟢 做多 (BUY)", "SELL": "🔴 做空 (SELL)", "HOLD": "⚪ 观望 (HOLD)"}.get(final_action, "⚪ 观望")
+    icon = {"BUY": "🟢 BUY", "SELL": "🔴 SELL", "HOLD": "⚪ HOLD"}.get(final_action, "⚪")
     
-    report = f"""{alert_prefix}
-【BTC {TIMEFRAME} 实盘量化引擎】
+    return f"""{alert_prefix}
+【BTC {TIMEFRAME} AI/MTF 共振引擎】
 时间: {time_str}
 闭合确认价: {current_price:.2f}
 
-[⚡ 当前决策]
-- 指令: {action_icon}
+[⚡ 终极决策]
+- 指令: {icon}
 - 逻辑: {reason}
 
-[💰 资金与风控测算 (基于 {ACCOUNT_BALANCE}U 账户)]
-- 建议开仓规模: {pos_size_btc_val:.4f} BTC
-- 若做多: 止损 {sl_long_str} | 止盈 {tp_long_str}
-- 若做空: 止损 {sl_short_str} | 止盈 {tp_short_str}
+[💰 资金管理]
+- 建议仓位: {pos_size:.4f} BTC
+- 多头: SL {sl_long:.2f} | TP {tp_long:.2f}
+- 空头: SL {sl_short:.2f} | TP {tp_short:.2f}
     """
-    return report
 
 def push_to_dingtalk(message):
     webhook = os.getenv("DINGTALK_WEBHOOK")
@@ -282,8 +278,7 @@ def push_to_dingtalk(message):
     payload = {"msgtype": "text", "text": {"content": message}}
     try:
         requests.post(webhook, headers=headers, json=payload, timeout=10)
-    except Exception as e:
-        print(f"钉钉推送失败: {e}")
+    except: pass
 
 def run_logic():
     df = fetch_alpaca_data(SYMBOL, TIMEFRAME, LIMIT)
@@ -299,43 +294,32 @@ def run_logic():
     
     state = load_state()
     last_action = state.get("last_action", "HOLD")
-    should_push = False
-    alert_prefix = ""
+    should_push, prefix = False, ""
 
     if final_action != "HOLD" and final_action != last_action:
-        should_push = True
-        alert_prefix = "🚨 [强烈信号：方向反转/新趋势确立]\n"
+        should_push, prefix = True, "🚨 [强烈信号：MTF 趋势反转]\n"
         state["simulated_position"] = 1 if final_action == "BUY" else -1
         state["entry_price"] = float(df.iloc[-1]['close'])
-        
     elif final_action == "HOLD" and last_action != "HOLD":
-        should_push = True
-        alert_prefix = "⚠️ [状态变更：动能衰竭/回归观望]\n"
+        should_push, prefix = True, "⚠️ [状态变更：大周期动力耗尽]\n"
         state["simulated_position"] = 0
-        
-    elif final_action != "HOLD" and final_action == last_action:
-        print(f"[{datetime.datetime.now(datetime.UTC)}] 信号维持 {final_action}，跳过推送以免轰炸。")
     else:
-        print(f"[{datetime.datetime.now(datetime.UTC)}] 持续观望中，无高价值信号。")
+        print(f"[{datetime.datetime.now(datetime.UTC)}] 维持 {final_action}")
 
     if should_push:
-        final_report = format_final_report(df, final_action, reason, alert_prefix)
-        print(final_report)
-        push_to_dingtalk(final_report)
-        
+        report = format_final_report(df, final_action, reason, prefix)
+        print(report)
+        push_to_dingtalk(report)
         state["last_action"] = final_action
         state["last_push_time"] = datetime.datetime.now(datetime.UTC).isoformat()
         save_state(state)
 
 def main():
     if DAEMON_MODE:
-        print(f"启动守护进程模式 (每 15 分钟 K线闭合触发)...")
         while True:
             wait_for_exact_kline()
-            try:
-                run_logic()
-            except Exception as e:
-                print(f"单次执行异常: {e}")
+            try: run_logic()
+            except Exception as e: print(f"异常: {e}")
     else:
         wait_for_exact_kline()
         run_logic()
