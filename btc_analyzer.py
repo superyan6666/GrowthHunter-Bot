@@ -78,7 +78,11 @@ def fetch_bitget_data(symbol, timeframe, limit):
             if not bars:
                 raise Exception("Bitget 返回数据为空")
                 
-            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quote_volume'])
+            # 关键修复：先将其转化为 DataFrame，再截取前 6 列（防止 API 偷偷增加第8、9列）
+            df = pd.DataFrame(bars)
+            df = df.iloc[:, :6] # 只保留 [ts, open, high, low, close, base_vol]
+            df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            
             df['timestamp'] = pd.to_datetime(pd.to_numeric(df['timestamp']), unit='ms')
             df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
             
