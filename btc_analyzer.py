@@ -7,81 +7,90 @@ import time
 import json
 
 # ================= 核心配置 =================
-SYMBOL = "BTCUSDT"
-TIMEFRAME = "15m"  
+SYMBOL = "BTCUSDT"       
+TIMEFRAME = "15m"        
 LIMIT = 500        
 RR_RATIO = 2.0     
 ACCOUNT_BALANCE = 10000  
 RISK_PER_TRADE = 0.02    
 
-# [新增] 工程运行配置
+# 工程运行配置
 STATE_FILE = "trade_state.json"
-DAEMON_MODE = False  # 设置为 True 则脚本会死循环运行，自动休眠等待下一个 K 线；False 则适合 crontab 单次触发
+DAEMON_MODE = False  # True=后台常驻死循环，False=Crontab单次触发
 
 def wait_for_exact_kline():
-    """[新增] 确保在 K 线彻底闭合后（+5秒）再执行计算，杜绝闪烁信号"""
+    """确保在 K 线彻底闭合后（+5秒）再执行计算，杜绝闪烁信号"""
     now = datetime.datetime.utcnow()
     minutes = now.minute
     seconds = now.second
     
     if DAEMON_MODE:
-        # 持续运行模式：计算距离下一次 15m 闭合的精准秒数
         next_minute = ((minutes // 15) + 1) * 15
         next_time = now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(minutes=next_minute, seconds=5)
         wait_seconds = (next_time - now).total_seconds()
-        print(f"[{now.strftime('%H:%M:%S')}] 守护模式运行中，休眠 {wait_seconds:.1f} 秒至 {next_time.strftime('%H:%M:%S')}...")
+        print(f"[{now.strftime('%H:%M:%S')}] 守护模式休眠 {wait_seconds:.1f} 秒至 {next_time.strftime('%H:%M:%S')}...")
         time.sleep(wait_seconds)
     else:
-        # Crontab 模式：如果当前恰好在 0-4 秒被唤醒，等待到 5 秒确信数据入库
         if minutes % 15 == 0 and seconds < 5:
             sleep_time = 5 - seconds
             print(f"[{now.strftime('%H:%M:%S')}] K 线刚收盘，等待 {sleep_time} 秒确信数据落盘...")
             time.sleep(sleep_time)
 
 def load_state():
-    """[新增] 加载本地持久化状态"""
+    """加载本地持久化状态"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 return json.load(f)
         except Exception as e:
             print(f"读取状态文件失败: {e}，将初始化新状态")
-    # 默认状态
     return {
         "last_action": "HOLD", 
         "last_push_time": "", 
-        "simulated_position": 0, # 1 为做多，-1 为做空，0 为空仓
+        "simulated_position": 0,
         "entry_price": 0.0
     }
 
 def save_state(state):
-    """[新增] 持久化状态到本地"""
+    """持久化状态到本地"""
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=4)
 
-def fetch_binance_data(symbol, timeframe, limit):
-    endpoints = [
-        "https://data-api.binance.vision/api/v3/klines",
-        "https://api1.binance.com/api/v3/klines",
-        "https://api.binance.com/api/v3/klines"
-    ]
-    params = {"symbol": symbol, "interval": timeframe, "limit": limit}
-    for attempt, url in enumerate(endpoints):
+def fetch_bitget_data(symbol, timeframe, limit):
+    """通过 Bitget V2 公共 API 获取 K 线数据 (抗封锁最优解)"""
+    url = "https://api.bitget.com/api/v2/spot/market/candles"
+    params = {"symbol": symbol, "granularity": timeframe, "limit": limit}
+    
+    for attempt in range(3):
         try:
             if attempt > 0:
                 time.sleep(2 ** attempt)
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status() 
             data = response.json()
-            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset', 'taker_buy_quote_asset', 'ignore'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            
+            if str(data.get("code")) != "00000":
+                raise Exception(f"Bitget API 返回错误: {data.get('msg')}")
+                
+            bars = data.get("data", [])
+            if not bars:
+                raise Exception("Bitget 返回数据为空")
+                
+            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quote_volume'])
+            df['timestamp'] = pd.to_datetime(pd.to_numeric(df['timestamp']), unit='ms')
             df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+            
+            # 关键修复：翻转倒序数组
+            df = df.sort_values('timestamp').reset_index(drop=True)
             return df
         except Exception as e:
+            print(f"Bitget API 尝试 {attempt+1} 失败: {e}")
             continue
-    raise Exception("所有 API 节点均连接失败。")
+            
+    raise Exception("Bitget API 连续连接失败，请检查网络。")
 
 def calculate_indicators(df):
+    """计算核心技术指标"""
     df['SMA_20'] = ta.sma(df['close'], length=20)
     df['RSI_14'] = ta.rsi(df['close'], length=14)
     df['ATR_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
@@ -106,27 +115,61 @@ def safe_fmt(value, fmt="{:.2f}"):
     return "数据不足" if pd.isna(value) else fmt.format(value)
 
 def build_ai_context(df):
-    """构建序列化 JSON（此处折叠，保持原样）"""
+    """构建序列化 JSON 喂给大模型"""
     latest = df.iloc[-1]
     recent_5 = [{"time": str(df.iloc[i]['timestamp']), "close": round(df.iloc[i]['close'], 2), "volume": round(df.iloc[i]['volume'], 2), "macd_hist": round(df.iloc[i]['MACD_Hist'], 2) if not pd.isna(df.iloc[i]['MACD_Hist']) else 0} for i in range(-5, 0)]
     context = {
-        "current_price": latest['close'], "macro_trend_ema200": latest['EMA_200'] if not pd.isna(latest['EMA_200']) else None,
+        "symbol": SYMBOL,
+        "timeframe": TIMEFRAME,
+        "current_price": latest['close'], 
+        "macro_trend_ema200": latest['EMA_200'] if not pd.isna(latest['EMA_200']) else None,
         "trend_strength_adx14": latest['ADX'] if not pd.isna(latest['ADX']) else None,
+        "volatility_atr14": latest['ATR_14'] if not pd.isna(latest['ATR_14']) else None,
+        "support_s1": latest['S1'] if not pd.isna(latest['S1']) else None,
+        "resistance_r1": latest['R1'] if not pd.isna(latest['R1']) else None,
+        "bbands_lower": latest['BB_Lower'],
+        "bbands_upper": latest['BB_Upper'],
         "vol_sma_20": latest['Vol_SMA_20'] if not pd.isna(latest['Vol_SMA_20']) else None,
         "recent_5_candles": recent_5
     }
     return json.dumps(context, ensure_ascii=False)
 
 def call_llm_decision(context_json):
+    """调用大模型决策并强制返回规范 JSON"""
     api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key: return {"action": "HOLD", "confidence": 0, "reason": "由于当前不启用大模型，由内部策略引擎接管拦截。"}
-    # ... 保留原有 LLM 请求逻辑 ...
-    return {"action": "HOLD", "confidence": 0.0, "reason": "待完善"}
+    api_base = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1") 
+    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    system_prompt = """你是一个顶级的量化加密货币交易AI。我将提供包含最新技术指标和最近5根K线序列的JSON数据。
+请严格遵守以下JSON格式输出，禁止任何多余文本：
+{"action": "BUY" | "SELL" | "HOLD", "confidence": 0.0到1.0的浮点数, "reason": "80字以内的专业分析理由"}
+防画门规则：若成交量萎缩或在ADX<20时出现伪突破，请务必返回HOLD。"""
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": context_json}
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2
+    }
+
+    try:
+        response = requests.post(f"{api_base}/chat/completions", headers=headers, json=payload, timeout=20)
+        response.raise_for_status()
+        decision = json.loads(response.json()['choices'][0]['message']['content'])
+        action = decision.get("action", "HOLD").upper()
+        if action not in ["BUY", "SELL", "HOLD"]: action = "HOLD"
+        return {"action": action, "confidence": float(decision.get("confidence", 0.0)), "reason": decision.get("reason", "未提供理由")}
+    except Exception as e:
+        print(f"LLM API 异常: {e}")
+        return {"action": "HOLD", "confidence": 0.0, "reason": f"AI服务调用异常，安全降级观望。({str(e)})"}
 
 def get_internal_signal(df):
-    """[提取] 如果不启用 LLM，退回使用内部信号引擎"""
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
+    """当无 AI Key 时接管的内部硬逻辑引擎"""
+    latest, prev = df.iloc[-1], df.iloc[-2]
     current_price = latest['close']
     adx, ema_200, vol_sma_20 = latest['ADX'], latest['EMA_200'], latest['Vol_SMA_20']
     
@@ -135,8 +178,7 @@ def get_internal_signal(df):
     macd_cross_up = latest['MACD_Hist'] > prev['MACD_Hist']
     macd_cross_down = latest['MACD_Hist'] < prev['MACD_Hist']
     vol_ratio = latest['volume'] / vol_sma_20 if vol_sma_20 > 0 else 0
-    rsi = latest['RSI_14']
-    s1, r1 = latest['S1'], latest['R1']
+    rsi, s1, r1 = latest['RSI_14'], latest['S1'], latest['R1']
     
     if adx < 20:
         if current_price <= s1 * 1.002 and rsi < 30: return {"action": "BUY", "reason": "[内部信号] 震荡市触底S1且RSI超卖"}
@@ -157,13 +199,13 @@ def format_final_report(df, final_action, reason, alert_prefix):
     if not pd.isna(atr) and atr > 0:
         sl_dist = 1.5 * atr
         pos_size_btc_val = (ACCOUNT_BALANCE * RISK_PER_TRADE) / sl_dist
-        pos_size_btc = f"{pos_size_btc_val:.4f} BTC"
         sl_long_str = safe_fmt(current_price - sl_dist)
         tp_long_str = safe_fmt(current_price + (sl_dist * RR_RATIO))
         sl_short_str = safe_fmt(current_price + sl_dist)
         tp_short_str = safe_fmt(current_price - (sl_dist * RR_RATIO))
     else:
-        pos_size_btc = sl_long_str = tp_long_str = sl_short_str = tp_short_str = "数据不足"
+        pos_size_btc_val = 0
+        sl_long_str = tp_long_str = sl_short_str = tp_short_str = "数据不足"
 
     time_str = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     action_icon = {"BUY": "🟢 做多 (BUY)", "SELL": "🔴 做空 (SELL)", "HOLD": "⚪ 观望 (HOLD)"}.get(final_action, "⚪ 观望")
@@ -178,7 +220,7 @@ def format_final_report(df, final_action, reason, alert_prefix):
 - 逻辑: {reason}
 
 [💰 资金与风控测算 (基于 {ACCOUNT_BALANCE}U 账户)]
-- 建议开仓规模: {pos_size_btc}
+- 建议开仓规模: {pos_size_btc_val:.4f} BTC
 - 若做多: 止损 {sl_long_str} | 止盈 {tp_long_str}
 - 若做空: 止损 {sl_short_str} | 止盈 {tp_short_str}
     """
@@ -195,22 +237,17 @@ def push_to_dingtalk(message):
         print(f"钉钉推送失败: {e}")
 
 def run_logic():
-    df = fetch_binance_data(SYMBOL, TIMEFRAME, LIMIT)
+    df = fetch_bitget_data(SYMBOL, TIMEFRAME, LIMIT)
     df = calculate_indicators(df)
     
-    # 优先尝试 LLM，如果无 Key 则降级使用刚才抽象出来的内部信号引擎
-    api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
-        context_json = build_ai_context(df)
-        decision = call_llm_decision(context_json)
+    if os.getenv("OPENAI_API_KEY"):
+        decision = call_llm_decision(build_ai_context(df))
     else:
         decision = get_internal_signal(df)
         
     final_action = decision.get("action", "HOLD")
     reason = decision.get("reason", "")
-    current_price = df.iloc[-1]['close']
     
-    # === 告警去重与分级模块 ===
     state = load_state()
     last_action = state.get("last_action", "HOLD")
     should_push = False
@@ -219,9 +256,8 @@ def run_logic():
     if final_action != "HOLD" and final_action != last_action:
         should_push = True
         alert_prefix = "🚨 [强烈信号：方向反转/新趋势确立]\n"
-        # 记录模拟持仓状态
         state["simulated_position"] = 1 if final_action == "BUY" else -1
-        state["entry_price"] = float(current_price)
+        state["entry_price"] = float(df.iloc[-1]['close'])
         
     elif final_action == "HOLD" and last_action != "HOLD":
         should_push = True
@@ -230,18 +266,14 @@ def run_logic():
         
     elif final_action != "HOLD" and final_action == last_action:
         print(f"[{datetime.datetime.utcnow()}] 信号维持 {final_action}，跳过推送以免轰炸。")
-        should_push = False
-        
     else:
         print(f"[{datetime.datetime.utcnow()}] 持续观望中，无高价值信号。")
-        should_push = False
 
     if should_push:
         final_report = format_final_report(df, final_action, reason, alert_prefix)
         print(final_report)
         push_to_dingtalk(final_report)
         
-        # 刷新记忆
         state["last_action"] = final_action
         state["last_push_time"] = datetime.datetime.utcnow().isoformat()
         save_state(state)
