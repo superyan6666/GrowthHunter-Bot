@@ -20,7 +20,7 @@ DAEMON_MODE = False  # True=后台常驻死循环，False=Crontab单次触发
 
 def wait_for_exact_kline():
     """确保在 K 线彻底闭合后（+5秒）再执行计算，杜绝闪烁信号"""
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.UTC)
     minutes = now.minute
     seconds = now.second
     
@@ -59,7 +59,9 @@ def save_state(state):
 def fetch_bitget_data(symbol, timeframe, limit):
     """通过 Bitget V2 公共 API 获取 K 线数据 (抗封锁最优解)"""
     url = "https://api.bitget.com/api/v2/spot/market/candles"
-    params = {"symbol": symbol, "granularity": timeframe, "limit": limit}
+    # Bitget 要求的参数是 15min, 1h 等，此处做兼容转换
+    bg_timeframe = timeframe.replace('m', 'min') if timeframe.endswith('m') else timeframe
+    params = {"symbol": symbol, "granularity": bg_timeframe, "limit": limit}
     
     for attempt in range(3):
         try:
@@ -207,7 +209,7 @@ def format_final_report(df, final_action, reason, alert_prefix):
         pos_size_btc_val = 0
         sl_long_str = tp_long_str = sl_short_str = tp_short_str = "数据不足"
 
-    time_str = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    time_str = datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
     action_icon = {"BUY": "🟢 做多 (BUY)", "SELL": "🔴 做空 (SELL)", "HOLD": "⚪ 观望 (HOLD)"}.get(final_action, "⚪ 观望")
     
     report = f"""{alert_prefix}
@@ -265,9 +267,9 @@ def run_logic():
         state["simulated_position"] = 0
         
     elif final_action != "HOLD" and final_action == last_action:
-        print(f"[{datetime.datetime.utcnow()}] 信号维持 {final_action}，跳过推送以免轰炸。")
+        print(f"[{datetime.datetime.now(datetime.UTC)}] 信号维持 {final_action}，跳过推送以免轰炸。")
     else:
-        print(f"[{datetime.datetime.utcnow()}] 持续观望中，无高价值信号。")
+        print(f"[{datetime.datetime.now(datetime.UTC)}] 持续观望中，无高价值信号。")
 
     if should_push:
         final_report = format_final_report(df, final_action, reason, alert_prefix)
@@ -275,7 +277,7 @@ def run_logic():
         push_to_dingtalk(final_report)
         
         state["last_action"] = final_action
-        state["last_push_time"] = datetime.datetime.utcnow().isoformat()
+        state["last_push_time"] = datetime.datetime.now(datetime.UTC).isoformat()
         save_state(state)
 
 def main():
