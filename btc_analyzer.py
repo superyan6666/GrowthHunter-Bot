@@ -135,49 +135,6 @@ def calculate_indicators(df):
 def safe_fmt(value, fmt="{:.2f}"):
     return "数据不足" if pd.isna(value) else fmt.format(value)
 
-def build_ai_context(df):
-    """构建序列化 JSON 喂给大模型"""
-    latest = df.iloc[-1]
-    recent_5 = [{"time": str(df.iloc[i]['timestamp']), "close": round(df.iloc[i]['close'], 2), "volume": round(df.iloc[i]['volume'], 2), "macd_hist": round(df.iloc[i]['MACD_Hist'], 2) if not pd.isna(df.iloc[i]['MACD_Hist']) else 0} for i in range(-5, 0)]
-    context = {
-        "symbol": SYMBOL,
-        "timeframe": TIMEFRAME,
-        "current_price": latest['close'], 
-        "macro_trend_ema200": latest['EMA_200'] if not pd.isna(latest['EMA_200']) else None,
-        "htf_trend_proxy": latest['EMA_HTF_Proxy'] if not pd.isna(latest['EMA_HTF_Proxy']) else None,
-        "trend_strength_adx14": latest['ADX'] if not pd.isna(latest['ADX']) else None,
-        "volatility_atr14": latest['ATR_14'] if not pd.isna(latest['ATR_14']) else None,
-        "recent_5_candles": recent_5
-    }
-    return json.dumps(context, ensure_ascii=False)
-
-def call_llm_decision(context_json):
-    """调用大模型决策"""
-    api_key = os.getenv("OPENAI_API_KEY")
-    api_base = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1") 
-    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    system_prompt = """你是一个顶级的加密货币交易AI。请根据技术指标和K线序列做出判断。
-必须以JSON格式输出：{"action": "BUY"|"SELL"|"HOLD", "confidence": 0.0-1.0, "reason": "分析理由"}
-重点：关注大周期趋势共振和底背离形态。"""
-
-    payload = {
-        "model": model,
-        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": context_json}],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2
-    }
-
-    try:
-        response = requests.post(f"{api_base}/chat/completions", headers=headers, json=payload, timeout=20)
-        response.raise_for_status()
-        decision = json.loads(response.json()['choices'][0]['message']['content'])
-        return {"action": decision.get("action", "HOLD").upper(), "confidence": float(decision.get("confidence", 0.0)), "reason": decision.get("reason", "")}
-    except Exception as e:
-        print(f"LLM API 异常: {e}")
-        return {"action": "HOLD", "confidence": 0.0, "reason": "AI请求失败，降级。"}
-
 def get_internal_signal(df):
     """[深度重构] 包含状态机、背离检测及 MTF 共振的决策引擎"""
     latest, prev = df.iloc[-1], df.iloc[-2]
@@ -277,10 +234,8 @@ def run_logic():
     df = fetch_bitget_data(SYMBOL, TIMEFRAME, LIMIT)
     df = calculate_indicators(df)
     
-    if os.getenv("OPENAI_API_KEY"):
-        decision = call_llm_decision(build_ai_context(df))
-    else:
-        decision = get_internal_signal(df)
+    # 直接由量化硬逻辑接管决策，移除 LLM 依赖
+    decision = get_internal_signal(df)
         
     final_action = decision.get("action", "HOLD")
     reason = decision.get("reason", "")
