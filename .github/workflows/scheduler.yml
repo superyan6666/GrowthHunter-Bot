@@ -21,7 +21,7 @@ jobs:
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests numpy pandas pandas-ta
+        pip install requests "numpy<2.0.0" pandas pandas-ta
 
     - name: Run BTC Analyzer Script
       run: python -u btc_analyzer.py
@@ -33,3 +33,11 @@ jobs:
         # [新增] 注入 Alpaca 凭证以支持行情抓取
         ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
         ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+
+    - name: Commit and Push State
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add trade_state.json || echo "No state file to add"
+        git diff-index --quiet HEAD || git commit -m "chore: update trade state [skip ci]"
+        git push
